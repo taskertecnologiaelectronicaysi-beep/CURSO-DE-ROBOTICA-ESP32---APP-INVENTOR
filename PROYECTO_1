@@ -1,0 +1,419 @@
+
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth clasico no disponible: usa un ESP32 normal (no S2/S3/C3).
+#endif
+
+BluetoothSerial SerialBT;
+#define NOMBRE_BT "RobotCar"
+
+// =====================================
+// TB6612FNG - CONTROLADOR U1
+// =====================================
+#define U1_PWMA 32
+#define U1_AIN1 25
+#define U1_AIN2 33
+#define U1_STBY 26
+
+#define U1_PWMB 12
+#define U1_BIN1 27
+#define U1_BIN2 14
+
+// =====================================
+// TB6612FNG - CONTROLADOR U2
+// =====================================
+#define U2_PWMA 0
+#define U2_AIN1 16
+#define U2_AIN2 4
+#define U2_STBY 17
+
+#define U2_PWMB 19
+#define U2_BIN1 5
+#define U2_BIN2 18
+
+// =====================================
+// CONFIGURACION PWM
+// =====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+#define PWM_MIN 60
+
+#define PASO_RAMPA 10
+#define INTERVALO_RAMPA_MS 10
+
+int velocidad = 180;
+
+int dirIzq = 0;
+int dirDer = 0;
+
+int objIzq = 0, objDer = 0;
+int actIzq = 0, actDer = 0;
+
+unsigned long ultimaRampa = 0;
+
+// Inversion de motores
+bool invM1A = false;
+bool invM1B = false;
+bool invM2A = false;
+bool invM2B = false;
+
+// =====================================
+// ESCALA DE VELOCIDAD
+// =====================================
+int escalar(int v) {
+  v = constrain(v, 0, 255);
+
+  if (v == 0) return 0;
+
+  return map(v, 1, 255, PWM_MIN, 255);
+}
+
+// =====================================
+// CONTROL DE MOTORES
+// =====================================
+void controlarMotor(int pwm, int in1, int in2, int valor, bool invertir) {
+
+  if (invertir) valor = -valor;
+
+  valor = constrain(valor, -255, 255);
+
+  if (valor > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  }
+  else if (valor < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  }
+  else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  ledcWrite(pwm, abs(valor));
+}
+
+void aplicarMotores(int izquierda, int derecha) {
+
+  controlarMotor(U1_PWMA, U1_AIN1, U1_AIN2, izquierda, invM1A);
+  controlarMotor(U2_PWMA, U2_AIN1, U2_AIN2, izquierda, invM2A);
+
+  controlarMotor(U1_PWMB, U1_BIN1, U1_BIN2, derecha, invM1B);
+  controlarMotor(U2_PWMB, U2_BIN1, U2_BIN2, derecha, invM2B);
+}
+
+// =====================================
+// OBJETIVO Y RAMPA
+// =====================================
+void actualizarObjetivo() {
+
+  int pwm = escalar(velocidad);
+
+  objIzq = dirIzq * pwm;
+  objDer = dirDer * pwm;
+}
+
+int acercar(int actual, int objetivo) {
+
+  // Impulso inicial para vencer la friccion
+  if (actual == 0 && objetivo != 0) {
+
+    int arranque = min(abs(objetivo), (int)PWM_MIN);
+
+    return (objetivo > 0) ? arranque : -arranque;
+  }
+
+  if (actual < objetivo)
+    return min(actual + PASO_RAMPA, objetivo);
+
+  if (actual > objetivo)
+    return max(actual - PASO_RAMPA, objetivo);
+
+  return actual;
+}
+
+void actualizarRampa() {
+
+  if (millis() - ultimaRampa < INTERVALO_RAMPA_MS)
+    return;
+
+  ultimaRampa = millis();
+
+  int nuevoIzq = acercar(actIzq, objIzq);
+  int nuevoDer = acercar(actDer, objDer);
+
+  if (nuevoIzq != actIzq || nuevoDer != actDer) {
+
+    actIzq = nuevoIzq;
+    actDer = nuevoDer;
+
+    aplicarMotores(actIzq, actDer);
+  }
+}
+
+// =====================================
+// MOVIMIENTOS
+// =====================================
+void mover(int izq, int der) {
+
+  dirIzq = izq;
+  dirDer = der;
+
+  actualizarObjetivo();
+
+  Serial.print("[VELOCIDAD=");
+  Serial.print(velocidad);
+  Serial.print(" PWM OBJETIVO=");
+  Serial.print(abs(objIzq));
+  Serial.println("]");
+}
+
+void avanzar() {
+  mover(1, 1);
+}
+
+void retroceder() {
+  mover(-1, -1);
+}
+
+void izquierda() {
+  mover(-1, 1);
+}
+
+void derecha() {
+  mover(1, -1);
+}
+
+// =====================================
+// DETENER MOTORES
+// =====================================
+void detener() {
+
+  dirIzq = dirDer = 0;
+
+  objIzq = objDer = 0;
+
+  actIzq = actDer = 0;
+
+  aplicarMotores(0, 0);
+}
+
+// =====================================
+// CAMBIAR VELOCIDAD
+// =====================================
+void cambiarVelocidad(int nueva) {
+
+  velocidad = constrain(nueva, 0, 255);
+
+  actualizarObjetivo();
+
+  Serial.print("VELOCIDAD: ");
+  Serial.print(velocidad);
+
+  Serial.print(" (PWM REAL: ");
+  Serial.print(escalar(velocidad));
+  Serial.println(")");
+}
+
+// =====================================
+// BLUETOOTH - RECEPCION DE BYTES
+//
+// 1 = AVANZAR
+// 2 = RETROCEDER
+// 3 = IZQUIERDA
+// 4 = DERECHA
+// 5 = STOP
+// 10-100 = SLIDER DE VELOCIDAD
+// =====================================
+void procesarByte(int b) {
+
+  switch (b) {
+
+    case 1:
+      avanzar();
+      Serial.println("AVANZANDO");
+      break;
+
+    case 2:
+      retroceder();
+      Serial.println("RETROCEDIENDO");
+      break;
+
+    case 3:
+      izquierda();
+      Serial.println("GIRANDO IZQUIERDA");
+      break;
+
+    case 4:
+      derecha();
+      Serial.println("GIRANDO DERECHA");
+      break;
+
+    case 5:
+      detener();
+      Serial.println("MOTORES DETENIDOS");
+      break;
+
+    default:
+
+      if (b >= 10 && b <= 100) {
+
+        cambiarVelocidad(map(b, 0, 100, 0, 255));
+      }
+
+      break;
+  }
+}
+
+// =====================================
+// COMANDOS USB PARA PRUEBAS
+// =====================================
+void procesarComando(String comando) {
+
+  comando.trim();
+  comando.toUpperCase();
+
+  if (comando.length() == 0) return;
+
+  if (comando == "F") {
+    avanzar();
+    Serial.println("AVANZANDO");
+  }
+
+  else if (comando == "B") {
+    retroceder();
+    Serial.println("RETROCEDIENDO");
+  }
+
+  else if (comando == "L") {
+    izquierda();
+    Serial.println("GIRANDO IZQUIERDA");
+  }
+
+  else if (comando == "R") {
+    derecha();
+    Serial.println("GIRANDO DERECHA");
+  }
+
+  else if (comando == "S") {
+    detener();
+    Serial.println("MOTORES DETENIDOS");
+  }
+
+  else if (comando == "+") {
+    cambiarVelocidad(velocidad + 10);
+  }
+
+  else if (comando == "-") {
+    cambiarVelocidad(velocidad - 10);
+  }
+
+  else if (comando.startsWith("V")) {
+    cambiarVelocidad(comando.substring(1).toInt());
+  }
+
+  else if (comando == "?") {
+
+    Serial.println("COMANDOS USB:");
+    Serial.println("F = AVANZAR");
+    Serial.println("B = RETROCEDER");
+    Serial.println("L = IZQUIERDA");
+    Serial.println("R = DERECHA");
+    Serial.println("S = STOP");
+    Serial.println("V0-V255 = VELOCIDAD");
+    Serial.println("+ / - = AJUSTAR VELOCIDAD");
+  }
+
+  else {
+    Serial.println("COMANDO NO RECONOCIDO");
+  }
+}
+
+// =====================================
+// CONFIGURACION INICIAL
+// =====================================
+void setup() {
+
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+
+  int pines[] = {
+    U1_AIN1, U1_AIN2,
+    U1_BIN1, U1_BIN2,
+    U2_AIN1, U2_AIN2,
+    U2_BIN1, U2_BIN2,
+    U1_STBY, U2_STBY
+  };
+
+  for (int i = 0; i < 10; i++) {
+
+    pinMode(pines[i], OUTPUT);
+    digitalWrite(pines[i], LOW);
+  }
+
+  // PWM ESP32 Arduino Core 3.x
+  ledcAttach(U1_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U1_PWMB, PWM_FREQ, PWM_RES);
+
+  ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U2_PWMB, PWM_FREQ, PWM_RES);
+
+  digitalWrite(U1_STBY, HIGH);
+  digitalWrite(U2_STBY, HIGH);
+
+  detener();
+
+  // Bluetooth Classic
+  SerialBT.begin(NOMBRE_BT);
+
+  Serial.println("==============================");
+  Serial.println(" ROBOT ESP32 - 4 RUEDAS");
+  Serial.println(" CONTROL BLUETOOTH");
+  Serial.print(" Bluetooth: ");
+  Serial.println(NOMBRE_BT);
+  Serial.println("==============================");
+
+  Serial.println("COMANDOS: 1 2 3 4 5");
+  Serial.println("SLIDER: 10-100");
+}
+
+// =====================================
+// BUCLE PRINCIPAL
+// =====================================
+void loop() {
+
+  // Recibir bytes desde App Inventor
+  while (SerialBT.available()) {
+
+    int b = SerialBT.read();
+
+    procesarByte(b);
+  }
+
+  // Comandos desde monitor serial USB
+  if (Serial.available()) {
+
+    String comando = Serial.readStringUntil('\n');
+
+    procesarComando(comando);
+  }
+
+  // Seguridad: desconexion Bluetooth
+  static bool eraConectado = false;
+
+  bool conectado = SerialBT.hasClient();
+
+  if (eraConectado && !conectado) {
+
+    detener();
+
+    Serial.println("BLUETOOTH DESCONECTADO: MOTORES DETENIDOS");
+  }
+
+  eraConectado = conectado;
+
+  // Actualizar rampa de aceleracion
+  actualizarRampa();
+}
