@@ -1,0 +1,422 @@
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+#include <ESP32Servo.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth clasico no disponible: usa un ESP32 normal (no S2/S3/C3).
+#endif
+
+BluetoothSerial SerialBT;
+Servo servoUltrasonico;
+
+#define NOMBRE_BT "RobotEvita"
+
+// =====================================
+// TB6612FNG - CONTROLADOR U1
+// =====================================
+#define U1_PWMA 32
+#define U1_AIN1 25
+#define U1_AIN2 33
+#define U1_STBY 26
+
+#define U1_PWMB 12
+#define U1_BIN1 27
+#define U1_BIN2 14
+
+// =====================================
+// TB6612FNG - CONTROLADOR U2
+// =====================================
+#define U2_PWMA 0
+#define U2_AIN1 16
+#define U2_AIN2 4
+#define U2_STBY 17
+
+#define U2_PWMB 19
+#define U2_BIN1 5
+#define U2_BIN2 18
+
+// =====================================
+// SERVOMOTOR
+// =====================================
+#define SERVO_PIN 13
+
+#define SERVO_CENTRO 90
+#define SERVO_IZQUIERDA 150
+#define SERVO_DERECHA 30
+
+// =====================================
+// SENSORES INFRARROJOS
+// =====================================
+#define IR_IZQUIERDO 2
+#define IR_DERECHO 15
+
+#define IR_ACTIVO LOW
+
+// =====================================
+// SENSOR ULTRASONICO HC-SR04
+// =====================================
+#define TRIG_PIN 21
+#define ECHO_PIN 22
+
+#define DISTANCIA_MINIMA 25
+
+// =====================================
+// CONFIGURACION PWM
+// =====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+#define PWM_MIN 60
+
+#define PASO_RAMPA 10
+#define INTERVALO_RAMPA_MS 10
+
+int velocidad = 180;
+
+int dirIzq = 0;
+int dirDer = 0;
+
+int objIzq = 0, objDer = 0;
+int actIzq = 0, actDer = 0;
+
+unsigned long ultimaRampa = 0;
+
+// Inversion de motores
+bool invM1A = false;
+bool invM1B = false;
+bool invM2A = false;
+bool invM2B = false;
+
+// =====================================
+// MODO AUTONOMO
+// =====================================
+bool modoAuto = false;
+
+bool girandoAuto = false;
+unsigned long finGiro = 0;
+
+#define TIEMPO_GIRO_MS 400
+
+// =====================================
+// ESCALA DE VELOCIDAD
+// =====================================
+int escalar(int v) {
+  v = constrain(v, 0, 255);
+  if (v == 0) return 0;
+  return map(v, 1, 255, PWM_MIN, 255);
+}
+
+// =====================================
+// CONTROL DE MOTORES
+// =====================================
+void controlarMotor(int pwm, int in1, int in2, int valor, bool invertir) {
+  if (invertir) valor = -valor;
+  valor = constrain(valor, -255, 255);
+
+  if (valor > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else if (valor < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  ledcWrite(pwm, abs(valor));
+}
+
+void aplicarMotores(int izquierda, int derecha) {
+  controlarMotor(U1_PWMA, U1_AIN1, U1_AIN2, izquierda, invM1A);
+  controlarMotor(U2_PWMA, U2_AIN1, U2_AIN2, izquierda, invM2A);
+  controlarMotor(U1_PWMB, U1_BIN1, U1_BIN2, derecha, invM1B);
+  controlarMotor(U2_PWMB, U2_BIN1, U2_BIN2, derecha, invM2B);
+}
+
+// =====================================
+// OBJETIVO Y RAMPA
+// =====================================
+void actualizarObjetivo() {
+  int pwm = escalar(velocidad);
+  objIzq = dirIzq * pwm;
+  objDer = dirDer * pwm;
+}
+
+int acercar(int actual, int objetivo) {
+  if (actual == 0 && objetivo != 0) {
+    int arranque = min(abs(objetivo), (int)PWM_MIN);
+    return (objetivo > 0) ? arranque : -arranque;
+  }
+  if (actual < objetivo) return min(actual + PASO_RAMPA, objetivo);
+  if (actual > objetivo) return max(actual - PASO_RAMPA, objetivo);
+  return actual;
+}
+
+void actualizarRampa() {
+  if (millis() - ultimaRampa < INTERVALO_RAMPA_MS) return;
+  ultimaRampa = millis();
+
+  int nuevoIzq = acercar(actIzq, objIzq);
+  int nuevoDer = acercar(actDer, objDer);
+
+  if (nuevoIzq != actIzq || nuevoDer != actDer) {
+    actIzq = nuevoIzq;
+    actDer = nuevoDer;
+    aplicarMotores(actIzq, actDer);
+  }
+}
+
+// =====================================
+// MOVIMIENTOS
+// =====================================
+void mover(int izq, int der) {
+  dirIzq = izq;
+  dirDer = der;
+  actualizarObjetivo();
+}
+
+void avanzar() { mover(1, 1); }
+void retroceder() { mover(-1, -1); }
+void izquierda() { mover(-1, 1); }
+void derecha() { mover(1, -1); }
+
+void detener() {
+  dirIzq = dirDer = 0;
+  objIzq = objDer = 0;
+  actIzq = actDer = 0;
+  aplicarMotores(0, 0);
+}
+
+void cambiarVelocidad(int nueva) {
+  velocidad = constrain(nueva, 0, 255);
+  actualizarObjetivo();
+}
+
+// =====================================
+// MEDICION ULTRASONICA
+// =====================================
+float medirDistancia() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duracion = pulseIn(ECHO_PIN, HIGH, 25000);
+  if (duracion == 0) return 999;
+  return (duracion * 0.0343) / 2.0;
+}
+
+// =====================================
+// MEDIR EN UNA DIRECCION
+// =====================================
+float medirDireccion(int angulo) {
+  servoUltrasonico.write(angulo);
+  delay(300); // Dar tiempo físico al servo para girar
+  float distancia = medirDistancia();
+
+  Serial.print("ANGULO: ");
+  Serial.print(angulo);
+  Serial.print(" DISTANCIA: ");
+  Serial.print(distancia);
+  Serial.println(" cm");
+
+  return distancia;
+}
+
+// =====================================
+// EXPLORAR IZQUIERDA Y DERECHA
+// =====================================
+void explorarEntorno(float &distIzq, float &distDer) {
+  detener();
+  Serial.println("EXPLORANDO ENTORNO CON SERVO...");
+
+  distIzq = medirDireccion(SERVO_IZQUIERDA);
+  delay(100);
+
+  distDer = medirDireccion(SERVO_DERECHA);
+  delay(100);
+
+  servoUltrasonico.write(SERVO_CENTRO);
+  delay(200);
+}
+
+// =====================================
+// INICIAR GIRO AUTONOMO
+// =====================================
+void iniciarGiro(bool haciaIzquierda) {
+  girandoAuto = true;
+  finGiro = millis() + TIEMPO_GIRO_MS;
+
+  if (haciaIzquierda) {
+    izquierda();
+    Serial.println("EVITANDO: GIRO IZQUIERDA");
+  } else {
+    derecha();
+    Serial.println("EVITANDO: GIRO DERECHA");
+  }
+}
+
+// =====================================
+// MODO EVITA-OBSTACULOS
+// =====================================
+void modoAutomatico() {
+  if (girandoAuto) {
+    if ((long)(millis() - finGiro) < 0) return;
+    girandoAuto = false;
+    detener();
+    return;
+  }
+
+  bool obstaculoIzq = (digitalRead(IR_IZQUIERDO) == IR_ACTIVO);
+  bool obstaculoDer = (digitalRead(IR_DERECHO) == IR_ACTIVO);
+
+  // Asegurar que el servo está en el centro para la marcha
+  servoUltrasonico.write(SERVO_CENTRO);
+  float distanciaFrontal = medirDistancia();
+
+  // SI DETECTA UN OBSTÁCULO FRONTAL O EN AMBOS LADOS
+  if (distanciaFrontal <= DISTANCIA_MINIMA || (obstaculoIzq && obstaculoDer)) {
+    detener();
+    Serial.println("OBSTACULO DETECTADO. INICIANDO ESCANEO...");
+
+    float distIzq, distDer;
+    explorarEntorno(distIzq, distDer);
+
+    if (distIzq > distDer && distIzq > DISTANCIA_MINIMA) {
+      iniciarGiro(true);
+    } else if (distDer > distIzq && distDer > DISTANCIA_MINIMA) {
+      iniciarGiro(false);
+    } else {
+      // Si ambos lados están bloqueados, retroceder
+      retroceder();
+      delay(300);
+      iniciarGiro(true);
+    }
+    return;
+  }
+
+  // Obstáculos individuales en IR laterales
+  if (obstaculoIzq) {
+    detener();
+    iniciarGiro(false);
+    return;
+  }
+
+  if (obstaculoDer) {
+    detener();
+    iniciarGiro(true);
+    return;
+  }
+
+  // Camino libre
+  if (dirIzq != 1 || dirDer != 1) {
+    avanzar();
+    Serial.println("CAMINO LIBRE: AVANZANDO");
+  }
+}
+
+// =====================================
+// ACTIVAR / DESACTIVAR AUTOMATICO
+// =====================================
+void activarAutomatico() {
+  detener();
+  girandoAuto = false;
+  modoAuto = true;
+  servoUltrasonico.write(SERVO_CENTRO);
+  Serial.println("MODO EVITA-OBSTACULOS ACTIVADO");
+}
+
+void desactivarAutomatico() {
+  modoAuto = false;
+  girandoAuto = false;
+  detener();
+  servoUltrasonico.write(SERVO_CENTRO);
+  Serial.println("MODO MANUAL ACTIVADO");
+}
+
+// =====================================
+// BLUETOOTH / COMANDOS
+// =====================================
+void procesarByte(int b) {
+  switch (b) {
+    case 1: desactivarAutomatico(); avanzar(); break;
+    case 2: desactivarAutomatico(); retroceder(); break;
+    case 3: desactivarAutomatico(); izquierda(); break;
+    case 4: desactivarAutomatico(); derecha(); break;
+    case 5: desactivarAutomatico(); detener(); break;
+    case 6: activarAutomatico(); break;
+    default:
+      if (b >= 10 && b <= 100) cambiarVelocidad(map(b, 10, 100, 0, 255));
+      break;
+  }
+}
+
+void procesarComando(String comando) {
+  comando.trim();
+  comando.toUpperCase();
+  if (comando.length() == 0) return;
+
+  if (comando == "F") { desactivarAutomatico(); avanzar(); }
+  else if (comando == "B") { desactivarAutomatico(); retroceder(); }
+  else if (comando == "L") { desactivarAutomatico(); izquierda(); }
+  else if (comando == "R") { desactivarAutomatico(); derecha(); }
+  else if (comando == "S") { desactivarAutomatico(); detener(); }
+  else if (comando == "A") { activarAutomatico(); }
+  else if (comando.startsWith("V")) { cambiarVelocidad(comando.substring(1).toInt()); }
+}
+
+// =====================================
+// SETUP & LOOP
+// =====================================
+void setup() {
+  Serial.begin(115200);
+
+  int pines[] = { U1_AIN1, U1_AIN2, U1_BIN1, U1_BIN2, U2_AIN1, U2_AIN2, U2_BIN1, U2_BIN2, U1_STBY, U2_STBY };
+  for (int i = 0; i < 10; i++) {
+    pinMode(pines[i], OUTPUT);
+    digitalWrite(pines[i], LOW);
+  }
+
+  pinMode(IR_IZQUIERDO, INPUT_PULLUP);
+  pinMode(IR_DERECHO, INPUT_PULLUP);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Configuración de Servomotor
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  servoUltrasonico.setPeriodHertz(50);
+  servoUltrasonico.attach(SERVO_PIN, 500, 2400);
+  servoUltrasonico.write(SERVO_CENTRO);
+
+  // PWM de Motores
+  ledcAttach(U1_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U1_PWMB, PWM_FREQ, PWM_RES);
+  ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U2_PWMB, PWM_FREQ, PWM_RES);
+
+  digitalWrite(U1_STBY, HIGH);
+  digitalWrite(U2_STBY, HIGH);
+
+  detener();
+  SerialBT.begin(NOMBRE_BT);
+}
+
+void loop() {
+  while (SerialBT.available()) procesarByte(SerialBT.read());
+
+  if (Serial.available()) {
+    String comando = Serial.readStringUntil('\n');
+    procesarComando(comando);
+  }
+
+  if (modoAuto) {
+    modoAutomatico();
+  }
+
+  actualizarRampa();
+}
