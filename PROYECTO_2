@@ -58,7 +58,7 @@ Servo servoUltrasonico;
 #define TRIG_PIN 21
 #define ECHO_PIN 22
 
-#define DISTANCIA_MINIMA 25
+#define DISTANCIA_MINIMA 20   // cm: por debajo de esto se considera obstaculo
 
 // =====================================
 // CONFIGURACION PWM
@@ -70,7 +70,55 @@ Servo servoUltrasonico;
 #define PASO_RAMPA 10
 #define INTERVALO_RAMPA_MS 10
 
+// =====================================
+// CALIBRACION DE NAVEGACION (AJUSTAR!)
+// Se miden con los comandos de calibracion (ver README al final)
+// =====================================
+#define VEL_NAV 180            // velocidad de REFERENCIA para la odometria (no limita el slider)
+#define CM_S_NAV 40.0f         // cm/s avanzando recto a VEL_NAV
+#define GRAD_S_NAV 200.0f      // grados/s girando sobre su eje a VEL_NAV
+
+// =====================================
+// PARAMETROS DE NAVEGACION
+// =====================================
+#define TOL_META_CM 8         // distancia a la meta para considerarla alcanzada
+#define TOL_ANG 6              // tolerancia de giro (grados)
+#define ANGULO_EVASION 65      // giro al esquivar un obstaculo frontal
+#define ANGULO_IR 35           // giro al esquivar con IR lateral
+#define RODEO_CM 25            // avance tras esquivar antes de re-orientarse a la meta
+#define SESGO_META 15          // cm "extra" que se da al lado que apunta a la meta
+#define DESVIO_MAX_GRAD 25     // si se desvia mas de esto, se re-orienta
+#define TIMEOUT_MISION_MS 120000UL
+#define TIMEOUT_GIRO_MS 3000UL
+#define TIEMPO_RETRO_MS 500UL
+#define INTERVALO_US_MS 60UL
+#define SERVO_ESPERA_MS 350UL
+
+// =====================================
+// ESTADOS
+// =====================================
+enum Modo { M_MANUAL, M_LIBRE, M_META, M_CAL };
+enum Estado {
+  E_DECIDIR,
+  E_AVANZAR,
+  E_GIRAR,
+  E_ESC_IZQ,
+  E_ESC_DER,
+  E_ESC_CENTRO,
+  E_RODEAR,
+  E_RETRO,
+  E_FIN
+};
+
+Modo modo = M_MANUAL;
+Estado estado = E_FIN;
+Estado estadoSig = E_AVANZAR;
+
+// =====================================
+// VARIABLES GLOBALES
+// =====================================
 int velocidad = 180;
+int velManual = 180;
 
 int dirIzq = 0;
 int dirDer = 0;
@@ -86,15 +134,43 @@ bool invM1B = false;
 bool invM2A = false;
 bool invM2B = false;
 
-// =====================================
-// MODO AUTONOMO
-// =====================================
-bool modoAuto = false;
+// Pose estimada (odometria por tiempo): cm y grados. Rumbo + = antihorario (izquierda)
+float posX = 0, posY = 0, rumbo = 0;
+unsigned long tPose = 0;
 
-bool girandoAuto = false;
-unsigned long finGiro = 0;
+// Meta (cm, respecto al origen A)
+float metaX = 70, metaY = 0;   // meta por defecto: 70 cm al frente de A
 
-#define TIEMPO_GIRO_MS 400
+// Navegacion
+unsigned long tEstado = 0, tMision = 0, tSondeo = 0, tVentana = 0, calFin = 0;
+float rumboObj = 0;
+float dIzq = 999, dDer = 999;
+float xIni = 0, yIni = 0;
+int contObs = 0;
+int contEvasiones = 0;
+
+// Retroceso previo a cada esquive
+float angPostRetro = 0;
+Estado estadoPostRetro = E_RODEAR;
+bool escanearPostRetro = false;
+
+// Protocolo BT para fijar meta: 250, X, Y
+int fasePar = 0;
+int parX = 0;
+
+// =====================================
+// UTILIDADES
+// =====================================
+float norm180(float a) {
+  while (a > 180) a -= 360;
+  while (a <= -180) a += 360;
+  return a;
+}
+
+void avisar(const char* msg) {
+  Serial.println(msg);
+  SerialBT.println(msg);
+}
 
 // =====================================
 // ESCALA DE VELOCIDAD
@@ -193,6 +269,28 @@ void cambiarVelocidad(int nueva) {
 }
 
 // =====================================
+// ODOMETRIA POR TIEMPO (estimacion de posicion)
+// Sin encoders ni brujula esto es una ESTIMACION: acumula error.
+// =====================================
+void actualizarPose() {
+  unsigned long t = millis();
+  float dt = (t - tPose) / 1000.0f;
+  tPose = t;
+  if (dt <= 0 || dt > 0.2f) return;
+
+  float ref = (float)escalar(VEL_NAV);
+  if (ref <= 0) return;
+
+  float v = ((actIzq + actDer) / 2.0f) / ref * CM_S_NAV;
+  float w = ((actDer - actIzq) / 2.0f) / ref * GRAD_S_NAV;
+
+  float r = rumbo * DEG_TO_RAD;
+  posX += v * cosf(r) * dt;
+  posY += v * sinf(r) * dt;
+  rumbo = norm180(rumbo + w * dt);
+}
+
+// =====================================
 // MEDICION ULTRASONICA
 // =====================================
 float medirDistancia() {
@@ -204,166 +302,405 @@ float medirDistancia() {
 
   unsigned long duracion = pulseIn(ECHO_PIN, HIGH, 25000);
   if (duracion == 0) return 999;
-  return (duracion * 0.0343) / 2.0;
+  return (duracion * 0.0343f) / 2.0f;
 }
 
-// =====================================
-// MEDIR EN UNA DIRECCION
-// =====================================
-float medirDireccion(int angulo) {
-  servoUltrasonico.write(angulo);
-  delay(300); // Dar tiempo físico al servo para girar
-  float distancia = medirDistancia();
-
-  Serial.print("ANGULO: ");
-  Serial.print(angulo);
-  Serial.print(" DISTANCIA: ");
-  Serial.print(distancia);
-  Serial.println(" cm");
-
-  return distancia;
+// Mediana de 3 lecturas (solo se usa con el robot detenido)
+float medirMediana() {
+  float a = medirDistancia();
+  delay(8);
+  float b = medirDistancia();
+  delay(8);
+  float c = medirDistancia();
+  float t;
+  if (a > b) { t = a; a = b; b = t; }
+  if (b > c) { t = b; b = c; c = t; }
+  if (a > b) { t = a; a = b; b = t; }
+  return b;
 }
 
-// =====================================
-// EXPLORAR IZQUIERDA Y DERECHA
-// =====================================
-void explorarEntorno(float &distIzq, float &distDer) {
-  detener();
-  Serial.println("EXPLORANDO ENTORNO CON SERVO...");
-
-  distIzq = medirDireccion(SERVO_IZQUIERDA);
-  delay(100);
-
-  distDer = medirDireccion(SERVO_DERECHA);
-  delay(100);
-
-  servoUltrasonico.write(SERVO_CENTRO);
-  delay(200);
-}
-
-// =====================================
-// INICIAR GIRO AUTONOMO
-// =====================================
-void iniciarGiro(bool haciaIzquierda) {
-  girandoAuto = true;
-  finGiro = millis() + TIEMPO_GIRO_MS;
-
-  if (haciaIzquierda) {
-    izquierda();
-    Serial.println("EVITANDO: GIRO IZQUIERDA");
-  } else {
-    derecha();
-    Serial.println("EVITANDO: GIRO DERECHA");
+// Obstaculo frontal confirmado con 2 lecturas seguidas (evita falsos positivos)
+bool frenteBloqueado() {
+  if (millis() - tSondeo >= INTERVALO_US_MS) {
+    tSondeo = millis();
+    float d = medirDistancia();
+    if (d <= DISTANCIA_MINIMA) contObs++;
+    else contObs = 0;
   }
+  return contObs >= 2;
 }
 
 // =====================================
-// MODO EVITA-OBSTACULOS
+// MAQUINA DE ESTADOS
 // =====================================
-void modoAutomatico() {
-  if (girandoAuto) {
-    if ((long)(millis() - finGiro) < 0) return;
-    girandoAuto = false;
-    detener();
-    return;
-  }
-
-  bool obstaculoIzq = (digitalRead(IR_IZQUIERDO) == IR_ACTIVO);
-  bool obstaculoDer = (digitalRead(IR_DERECHO) == IR_ACTIVO);
-
-  // Asegurar que el servo está en el centro para la marcha
-  servoUltrasonico.write(SERVO_CENTRO);
-  float distanciaFrontal = medirDistancia();
-
-  // SI DETECTA UN OBSTÁCULO FRONTAL O EN AMBOS LADOS
-  if (distanciaFrontal <= DISTANCIA_MINIMA || (obstaculoIzq && obstaculoDer)) {
-    detener();
-    Serial.println("OBSTACULO DETECTADO. INICIANDO ESCANEO...");
-
-    float distIzq, distDer;
-    explorarEntorno(distIzq, distDer);
-
-    if (distIzq > distDer && distIzq > DISTANCIA_MINIMA) {
-      iniciarGiro(true);
-    } else if (distDer > distIzq && distDer > DISTANCIA_MINIMA) {
-      iniciarGiro(false);
-    } else {
-      // Si ambos lados están bloqueados, retroceder
+void cambiarEstado(Estado e) {
+  estado = e;
+  tEstado = millis();
+  switch (e) {
+    case E_ESC_IZQ:
+      detener();
+      servoUltrasonico.write(SERVO_IZQUIERDA);
+      break;
+    case E_ESC_DER:
+      servoUltrasonico.write(SERVO_DERECHA);
+      break;
+    case E_ESC_CENTRO:
+      servoUltrasonico.write(SERVO_CENTRO);
+      break;
+    case E_RODEAR:
+      xIni = posX;
+      yIni = posY;
+      contObs = 0;
+      break;
+    case E_RETRO:
       retroceder();
-      delay(300);
-      iniciarGiro(true);
-    }
-    return;
-  }
-
-  // Obstáculos individuales en IR laterales
-  if (obstaculoIzq) {
-    detener();
-    iniciarGiro(false);
-    return;
-  }
-
-  if (obstaculoDer) {
-    detener();
-    iniciarGiro(true);
-    return;
-  }
-
-  // Camino libre
-  if (dirIzq != 1 || dirDer != 1) {
-    avanzar();
-    Serial.println("CAMINO LIBRE: AVANZANDO");
-  }
-}
-
-// =====================================
-// ACTIVAR / DESACTIVAR AUTOMATICO
-// =====================================
-void activarAutomatico() {
-  detener();
-  girandoAuto = false;
-  modoAuto = true;
-  servoUltrasonico.write(SERVO_CENTRO);
-  Serial.println("MODO EVITA-OBSTACULOS ACTIVADO");
-}
-
-void desactivarAutomatico() {
-  modoAuto = false;
-  girandoAuto = false;
-  detener();
-  servoUltrasonico.write(SERVO_CENTRO);
-  Serial.println("MODO MANUAL ACTIVADO");
-}
-
-// =====================================
-// BLUETOOTH / COMANDOS
-// =====================================
-void procesarByte(int b) {
-  switch (b) {
-    case 1: desactivarAutomatico(); avanzar(); break;
-    case 2: desactivarAutomatico(); retroceder(); break;
-    case 3: desactivarAutomatico(); izquierda(); break;
-    case 4: desactivarAutomatico(); derecha(); break;
-    case 5: desactivarAutomatico(); detener(); break;
-    case 6: activarAutomatico(); break;
+      break;
+    case E_AVANZAR:
+      contObs = 0;
+      break;
     default:
-      if (b >= 10 && b <= 100) cambiarVelocidad(map(b, 10, 100, 0, 255));
       break;
   }
 }
 
+void iniciarGiro(float objetivo, Estado sig) {
+  rumboObj = norm180(objetivo);
+  estadoSig = sig;
+  if (norm180(rumboObj - rumbo) > 0) izquierda();
+  else derecha();
+  cambiarEstado(E_GIRAR);
+}
+
+// Retrocede un poco y despues gira (o escanea) para separarse del obstaculo
+void iniciarRetro(float ang, Estado sig, bool escanear) {
+  angPostRetro = ang;
+  estadoPostRetro = sig;
+  escanearPostRetro = escanear;
+  cambiarEstado(E_RETRO);   // el retroceso se activa al entrar al estado
+}
+
+void registrarEvasion() {
+  if (millis() - tVentana > 10000UL) {
+    tVentana = millis();
+    contEvasiones = 0;
+  }
+  contEvasiones++;
+}
+
+void iniciarEscaneo() {
+  detener();
+  registrarEvasion();
+  avisar("OBSTACULO: RETROCEDE Y ESCANEA");
+  iniciarRetro(0, E_RODEAR, true);
+}
+
+// Obstaculo detectado por un IR lateral: retrocede y gira hacia el lado contrario
+void evadirIR(bool obstIzq) {
+  detener();
+  registrarEvasion();
+  float ang = obstIzq ? -ANGULO_IR : ANGULO_IR;
+  if (contEvasiones >= 4) {
+    contEvasiones = 0;
+    ang = obstIzq ? -150 : 150;
+    avisar("ATRAPADO: GIRO GRANDE");
+  } else {
+    avisar(obstIzq ? "IR IZQ: RETROCEDE Y GIRA DER" : "IR DER: RETROCEDE Y GIRA IZQ");
+  }
+  iniciarRetro(ang, E_RODEAR, false);
+}
+
+void terminar(const char* msg) {
+  detener();
+  modo = M_MANUAL;
+  estado = E_FIN;
+  servoUltrasonico.write(SERVO_CENTRO);
+  cambiarVelocidad(velManual);
+  avisar(msg);
+}
+
+void decidirEvasion() {
+  float pi = dIzq, pd = dDer;
+
+  if (modo == M_META) {
+    float err = norm180(atan2f(metaY - posY, metaX - posX) * RAD_TO_DEG - rumbo);
+    if (err > 0) pi += SESGO_META;   // la meta queda hacia la izquierda
+    else pd += SESGO_META;
+  }
+
+  bool atrapado = (contEvasiones >= 4) ||
+                  (dIzq <= DISTANCIA_MINIMA && dDer <= DISTANCIA_MINIMA);
+  if (atrapado) {
+    contEvasiones = 0;
+    avisar("ATRAPADO: RETROCEDE Y GIRA");
+    iniciarRetro((dIzq >= dDer) ? 150 : -150, E_DECIDIR, false);
+    return;
+  }
+
+  if (pi >= pd) {
+    avisar("EVITANDO: IZQUIERDA");
+    iniciarGiro(rumbo + ANGULO_EVASION, E_RODEAR);
+  } else {
+    avisar("EVITANDO: DERECHA");
+    iniciarGiro(rumbo - ANGULO_EVASION, E_RODEAR);
+  }
+}
+
+void navegar() {
+  unsigned long ahora = millis();
+
+  if (modo == M_META && (ahora - tMision > TIMEOUT_MISION_MS)) {
+    terminar("TIMEOUT: NO LLEGO A LA META");
+    return;
+  }
+
+  switch (estado) {
+
+    case E_DECIDIR: {
+      if (modo == M_META) {
+        float dx = metaX - posX, dy = metaY - posY;
+        if (hypotf(dx, dy) <= TOL_META_CM) {
+          terminar("LLEGO A LA META");
+          return;
+        }
+        float err = norm180(atan2f(dy, dx) * RAD_TO_DEG - rumbo);
+        if (fabsf(err) > TOL_ANG) {
+          iniciarGiro(rumbo + err, E_AVANZAR);
+          return;
+        }
+      }
+      cambiarEstado(E_AVANZAR);
+      break;
+    }
+
+    case E_GIRAR: {
+      float err = norm180(rumboObj - rumbo);
+      if (fabsf(err) <= TOL_ANG || (ahora - tEstado) > TIMEOUT_GIRO_MS) {
+        detener();
+        cambiarEstado(estadoSig);
+      }
+      break;
+    }
+
+    case E_AVANZAR: {
+      if (modo == M_META) {
+        float dx = metaX - posX, dy = metaY - posY;
+        if (hypotf(dx, dy) <= TOL_META_CM) {
+          terminar("LLEGO A LA META");
+          return;
+        }
+        float err = norm180(atan2f(dy, dx) * RAD_TO_DEG - rumbo);
+        if (fabsf(err) > DESVIO_MAX_GRAD) {
+          detener();
+          cambiarEstado(E_DECIDIR);
+          return;
+        }
+      }
+
+      bool irI = (digitalRead(IR_IZQUIERDO) == IR_ACTIVO);
+      bool irD = (digitalRead(IR_DERECHO) == IR_ACTIVO);
+
+      if (irI && irD) { iniciarEscaneo(); return; }
+      if (irI) { evadirIR(true); return; }
+      if (irD) { evadirIR(false); return; }
+      if (frenteBloqueado()) { iniciarEscaneo(); return; }
+
+      if (dirIzq != 1 || dirDer != 1) avanzar();
+      break;
+    }
+
+    case E_ESC_IZQ:
+      if (ahora - tEstado >= SERVO_ESPERA_MS) {
+        dIzq = medirMediana();
+        Serial.print("IZQ: "); Serial.println(dIzq);
+        cambiarEstado(E_ESC_DER);
+      }
+      break;
+
+    case E_ESC_DER:
+      if (ahora - tEstado >= SERVO_ESPERA_MS) {
+        dDer = medirMediana();
+        Serial.print("DER: "); Serial.println(dDer);
+        cambiarEstado(E_ESC_CENTRO);
+      }
+      break;
+
+    case E_ESC_CENTRO:
+      if (ahora - tEstado >= 250) decidirEvasion();
+      break;
+
+    case E_RODEAR: {
+      float rec = hypotf(posX - xIni, posY - yIni);
+      if (rec >= RODEO_CM || (ahora - tEstado) > 2500) {
+        detener();
+        cambiarEstado(E_DECIDIR);
+        break;
+      }
+      bool irI = (digitalRead(IR_IZQUIERDO) == IR_ACTIVO);
+      bool irD = (digitalRead(IR_DERECHO) == IR_ACTIVO);
+      if (irI || irD || frenteBloqueado()) {
+        detener();
+        cambiarEstado(E_AVANZAR);
+        break;
+      }
+      if (dirIzq != 1 || dirDer != 1) avanzar();
+      break;
+    }
+
+    case E_RETRO:
+      // Atras no hay sensor: retroceso corto y a ciegas
+      if (ahora - tEstado >= TIEMPO_RETRO_MS) {
+        detener();
+        if (escanearPostRetro) {
+          escanearPostRetro = false;
+          cambiarEstado(E_ESC_IZQ);
+        } else {
+          iniciarGiro(rumbo + angPostRetro, estadoPostRetro);
+        }
+      }
+      break;
+
+    case E_FIN:
+    default:
+      break;
+  }
+}
+
+// =====================================
+// CAMBIO DE MODOS
+// =====================================
+void iniciarManual() {
+  if (modo == M_MANUAL) return;   // no reiniciar la rampa si ya esta en manual
+  modo = M_MANUAL;
+  estado = E_FIN;
+  detener();
+  servoUltrasonico.write(SERVO_CENTRO);
+  cambiarVelocidad(velManual);
+  avisar("MODO MANUAL");
+}
+
+void iniciarLibre() {
+  detener();
+  modo = M_LIBRE;
+  cambiarVelocidad(velManual);
+  servoUltrasonico.write(SERVO_CENTRO);
+  contEvasiones = 0;
+  cambiarEstado(E_AVANZAR);
+  avisar("MODO EVITA-OBSTACULOS");
+}
+
+void iniciarMeta() {
+  detener();
+  modo = M_META;
+  cambiarVelocidad(velManual);
+  servoUltrasonico.write(SERVO_CENTRO);
+  contEvasiones = 0;
+  tMision = millis();
+  cambiarEstado(E_DECIDIR);
+  Serial.print("META: X="); Serial.print(metaX);
+  Serial.print(" Y="); Serial.println(metaY);
+  avisar("MODO META: INICIANDO");
+}
+
+void imprimirPose() {
+  Serial.print("POSE x="); Serial.print(posX);
+  Serial.print(" y="); Serial.print(posY);
+  Serial.print(" rumbo="); Serial.println(rumbo);
+}
+
+// Calibracion: tipo 1 = avanza 2 s, tipo 2 = gira a la izquierda 1 s
+void iniciarCal(int tipo) {
+  detener();
+  posX = posY = 0;
+  rumbo = 0;
+  modo = M_CAL;
+  estado = E_FIN;
+  cambiarVelocidad(velManual);   // se calibra con la velocidad del slider
+  if (tipo == 1) { calFin = millis() + 2000; avanzar(); }
+  else { calFin = millis() + 1000; izquierda(); }
+}
+
+void finCal() {
+  detener();
+  modo = M_MANUAL;
+  cambiarVelocidad(velManual);
+  imprimirPose();
+  avisar("CAL LISTA (ver README)");
+}
+
+// =====================================
+// BLUETOOTH / COMANDOS
+// Bytes: 1 adelante, 2 atras, 3 izq, 4 der, 5 stop, 6 auto libre,
+//        7 ir a META, 8 fijar ORIGEN (punto A) aqui,
+//        10-100 velocidad, 101 cal avance, 102 cal giro,
+//        250 X Y = fijar meta (X*5 cm, (Y-128)*5 cm)
+// =====================================
+void procesarByte(int b) {
+  if (fasePar == 1) { parX = b; fasePar = 2; return; }
+  if (fasePar == 2) {
+    metaX = parX * 5.0f;
+    metaY = (b - 128) * 5.0f;
+    fasePar = 0;
+    Serial.print("META FIJADA X="); Serial.print(metaX);
+    Serial.print(" Y="); Serial.println(metaY);
+    SerialBT.println("META OK");
+    return;
+  }
+
+  switch (b) {
+    case 1: iniciarManual(); avanzar(); break;
+    case 2: iniciarManual(); retroceder(); break;
+    case 3: iniciarManual(); izquierda(); break;
+    case 4: iniciarManual(); derecha(); break;
+    case 5: iniciarManual(); detener(); break;
+    case 6: iniciarLibre(); break;
+    case 7: iniciarMeta(); break;
+    case 8:
+      posX = posY = 0;
+      rumbo = 0;
+      avisar("ORIGEN FIJADO");
+      break;
+    case 101: iniciarCal(1); break;
+    case 102: iniciarCal(2); break;
+    case 250: fasePar = 1; break;
+    default:
+      if (b >= 10 && b <= 100) {
+        velManual = map(b, 10, 100, 0, 255);
+        if (modo != M_CAL) cambiarVelocidad(velManual);
+      }
+      break;
+  }
+}
+
+// Comandos por USB (monitor serie)
 void procesarComando(String comando) {
   comando.trim();
   comando.toUpperCase();
   if (comando.length() == 0) return;
 
-  if (comando == "F") { desactivarAutomatico(); avanzar(); }
-  else if (comando == "B") { desactivarAutomatico(); retroceder(); }
-  else if (comando == "L") { desactivarAutomatico(); izquierda(); }
-  else if (comando == "R") { desactivarAutomatico(); derecha(); }
-  else if (comando == "S") { desactivarAutomatico(); detener(); }
-  else if (comando == "A") { activarAutomatico(); }
-  else if (comando.startsWith("V")) { cambiarVelocidad(comando.substring(1).toInt()); }
+  if (comando == "F") { iniciarManual(); avanzar(); }
+  else if (comando == "B") { iniciarManual(); retroceder(); }
+  else if (comando == "L") { iniciarManual(); izquierda(); }
+  else if (comando == "R") { iniciarManual(); derecha(); }
+  else if (comando == "S") { iniciarManual(); detener(); }
+  else if (comando == "A") { iniciarLibre(); }
+  else if (comando == "M") { iniciarMeta(); }
+  else if (comando == "O") { posX = posY = 0; rumbo = 0; avisar("ORIGEN FIJADO"); }
+  else if (comando == "P") { imprimirPose(); }
+  else if (comando == "C1") { iniciarCal(1); }
+  else if (comando == "C2") { iniciarCal(2); }
+  else if (comando.startsWith("G")) {
+    float gx = 0, gy = 0;
+    if (sscanf(comando.c_str() + 1, "%f %f", &gx, &gy) == 2) {
+      metaX = gx;
+      metaY = gy;
+      Serial.print("META FIJADA X="); Serial.print(metaX);
+      Serial.print(" Y="); Serial.println(metaY);
+    }
+  }
+  else if (comando.startsWith("V")) {
+    velManual = constrain(comando.substring(1).toInt(), 0, 255);
+    if (modo != M_CAL) cambiarVelocidad(velManual);
+  }
 }
 
 // =====================================
@@ -384,7 +721,7 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
   digitalWrite(TRIG_PIN, LOW);
 
-  // Configuración de Servomotor
+  // Servomotor
   ESP32PWM::allocateTimer(0);
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
@@ -393,7 +730,7 @@ void setup() {
   servoUltrasonico.attach(SERVO_PIN, 500, 2400);
   servoUltrasonico.write(SERVO_CENTRO);
 
-  // PWM de Motores
+  // PWM de motores
   ledcAttach(U1_PWMA, PWM_FREQ, PWM_RES);
   ledcAttach(U1_PWMB, PWM_FREQ, PWM_RES);
   ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
@@ -404,6 +741,7 @@ void setup() {
 
   detener();
   SerialBT.begin(NOMBRE_BT);
+  tPose = millis();
 }
 
 void loop() {
@@ -414,8 +752,24 @@ void loop() {
     procesarComando(comando);
   }
 
-  if (modoAuto) {
-    modoAutomatico();
+  actualizarPose();
+
+  static unsigned long tLog = 0;
+  if ((modo == M_LIBRE || modo == M_META) && millis() - tLog > 500) {
+    tLog = millis();
+    Serial.print(modo == M_META ? "META" : "LIBRE");
+    Serial.print(" estado="); Serial.print((int)estado);
+    Serial.print(" x="); Serial.print(posX);
+    Serial.print(" y="); Serial.print(posY);
+    Serial.print(" rumbo="); Serial.print(rumbo);
+    Serial.print(" meta=("); Serial.print(metaX);
+    Serial.print(","); Serial.print(metaY); Serial.println(")");
+  }
+
+  if (modo == M_LIBRE || modo == M_META) {
+    navegar();
+  } else if (modo == M_CAL && millis() >= calFin) {
+    finCal();
   }
 
   actualizarRampa();
