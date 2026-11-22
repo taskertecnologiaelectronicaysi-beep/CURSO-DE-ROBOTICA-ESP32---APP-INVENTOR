@@ -1,0 +1,796 @@
+
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth clasico no disponible: usa un ESP32 normal (no S2/S3/C3).
+#endif
+
+BluetoothSerial SerialBT;
+#define NOMBRE_BT "RobotCar"
+
+// =====================================
+// TB6612FNG - CONTROLADOR U1
+// =====================================
+#define U1_PWMA 32
+#define U1_AIN1 25
+#define U1_AIN2 33
+#define U1_STBY 26
+
+#define U1_PWMB 12
+#define U1_BIN1 27
+#define U1_BIN2 14
+
+// =====================================
+// TB6612FNG - CONTROLADOR U2
+// =====================================
+#define U2_PWMA 0
+#define U2_AIN1 16
+#define U2_AIN2 4
+#define U2_STBY 17
+
+#define U2_PWMB 19
+#define U2_BIN1 5
+#define U2_BIN2 18
+
+// =====================================
+// SENSORES TCRT5000 - 5 CANALES
+// =====================================
+#define S1 34
+#define S2 35
+#define S3 23
+#define S4 22
+#define S5 21
+
+const int sensores[5] = {
+  S1, S2, S3, S4, S5
+};
+
+// true = HIGH detecta blanco
+// false = LOW detecta blanco
+#define LINEA_BLANCA_HIGH true
+
+// Posiciones de los sensores
+const int pesos[5] = {
+  -2, -1, 0, 1, 2
+};
+
+// =====================================
+// MODOS DE FUNCIONAMIENTO
+// =====================================
+enum Modo {
+  MODO_MANUAL,
+  MODO_AUTOMATICO,
+  MODO_PID
+};
+
+Modo modoActual = MODO_MANUAL;
+
+bool marchaHabilitada = false;
+
+// =====================================
+// CONFIGURACION PWM
+// =====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+#define PWM_MIN 60
+
+#define PASO_RAMPA 10
+#define INTERVALO_RAMPA_MS 10
+
+int velocidad = 180;
+
+int dirIzq = 0;
+int dirDer = 0;
+
+int objIzq = 0;
+int objDer = 0;
+
+int actIzq = 0;
+int actDer = 0;
+
+unsigned long ultimaRampa = 0;
+
+// Inversion de motores
+bool invM1A = false;
+bool invM1B = false;
+bool invM2A = false;
+bool invM2B = false;
+
+// =====================================
+// CONFIGURACION PID
+// =====================================
+float Kp = 35.0;
+float Ki = 0.5;
+float Kd = 0.18;
+
+float errorPID = 0;
+float errorAnterior = 0;
+float integralPID = 0;
+float derivadaPID = 0;
+
+float limiteIntegral = 10.0;
+float limiteCorreccion = 120.0;
+
+unsigned long ultimaLecturaControl = 0;
+
+#define INTERVALO_CONTROL_MS 10
+
+// =====================================
+// ESCALA DE VELOCIDAD
+// =====================================
+int escalar(int v) {
+
+  v = constrain(v, 0, 255);
+
+  if (v == 0) return 0;
+
+  return map(v, 1, 255, PWM_MIN, 255);
+}
+
+// =====================================
+// CONTROL DE MOTORES
+// =====================================
+void controlarMotor(
+  int pwm,
+  int in1,
+  int in2,
+  int valor,
+  bool invertir
+) {
+
+  if (invertir) valor = -valor;
+
+  valor = constrain(valor, -255, 255);
+
+  if (valor > 0) {
+
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+
+  }
+  else if (valor < 0) {
+
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+
+  }
+  else {
+
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  ledcWrite(pwm, abs(valor));
+}
+
+void aplicarMotores(int izquierda, int derecha) {
+
+  controlarMotor(
+    U1_PWMA, U1_AIN1, U1_AIN2,
+    izquierda, invM1A
+  );
+
+  controlarMotor(
+    U2_PWMA, U2_AIN1, U2_AIN2,
+    izquierda, invM2A
+  );
+
+  controlarMotor(
+    U1_PWMB, U1_BIN1, U1_BIN2,
+    derecha, invM1B
+  );
+
+  controlarMotor(
+    U2_PWMB, U2_BIN1, U2_BIN2,
+    derecha, invM2B
+  );
+}
+
+// =====================================
+// OBJETIVOS DE LOS MOTORES
+// =====================================
+void establecerObjetivos(int izquierda, int derecha) {
+
+  objIzq = constrain(izquierda, -255, 255);
+  objDer = constrain(derecha, -255, 255);
+}
+
+void actualizarObjetivoManual() {
+
+  int pwm = escalar(velocidad);
+
+  if (!marchaHabilitada) {
+    establecerObjetivos(0, 0);
+    return;
+  }
+
+  establecerObjetivos(
+    dirIzq * pwm,
+    dirDer * pwm
+  );
+}
+
+// =====================================
+// RAMPA DE ACELERACION
+// =====================================
+int acercar(int actual, int objetivo) {
+
+  // Impulso inicial
+  if (actual == 0 && objetivo != 0) {
+
+    int arranque = min(
+      abs(objetivo),
+      (int)PWM_MIN
+    );
+
+    return (objetivo > 0) ? arranque : -arranque;
+  }
+
+  if (actual < objetivo)
+    return min(actual + PASO_RAMPA, objetivo);
+
+  if (actual > objetivo)
+    return max(actual - PASO_RAMPA, objetivo);
+
+  return actual;
+}
+
+void actualizarRampa() {
+
+  if (millis() - ultimaRampa < INTERVALO_RAMPA_MS)
+    return;
+
+  ultimaRampa = millis();
+
+  int nuevoIzq = acercar(actIzq, objIzq);
+  int nuevoDer = acercar(actDer, objDer);
+
+  if (nuevoIzq != actIzq || nuevoDer != actDer) {
+
+    actIzq = nuevoIzq;
+    actDer = nuevoDer;
+
+    aplicarMotores(actIzq, actDer);
+  }
+}
+
+// =====================================
+// REINICIAR VARIABLES DE CONTROL
+// =====================================
+void reiniciarControl() {
+
+  errorPID = 0;
+  errorAnterior = 0;
+  integralPID = 0;
+  derivadaPID = 0;
+
+  ultimaLecturaControl = millis();
+}
+
+// =====================================
+// DETENER MOTORES
+// =====================================
+void detener() {
+
+  marchaHabilitada = false;
+
+  dirIzq = 0;
+  dirDer = 0;
+
+  establecerObjetivos(0, 0);
+
+  actIzq = 0;
+  actDer = 0;
+
+  aplicarMotores(0, 0);
+}
+
+// =====================================
+// CAMBIAR VELOCIDAD
+// =====================================
+void cambiarVelocidad(int nueva) {
+
+  velocidad = constrain(nueva, 0, 255);
+
+  if (modoActual == MODO_MANUAL) {
+    actualizarObjetivoManual();
+  }
+
+  Serial.print("VELOCIDAD BASE: ");
+  Serial.println(velocidad);
+}
+
+// =====================================
+// ACTIVAR MODO AUTOMATICO
+// =====================================
+void activarAutomatico() {
+
+  detener();
+
+  modoActual = MODO_AUTOMATICO;
+
+  reiniciarControl();
+
+  marchaHabilitada = true;
+
+  Serial.println("MODO AUTOMATICO ACTIVADO");
+}
+
+// =====================================
+// ACTIVAR MODO PID
+// =====================================
+void activarPID() {
+
+  detener();
+
+  modoActual = MODO_PID;
+
+  reiniciarControl();
+
+  marchaHabilitada = true;
+
+  Serial.println("MODO PID ACTIVADO");
+}
+
+// =====================================
+// CONTROL MANUAL
+// =====================================
+void mover(int izq, int der) {
+
+  // Si venimos de automatico o PID,
+  // cambiar al modo manual
+  if (modoActual != MODO_MANUAL) {
+
+    detener();
+
+    modoActual = MODO_MANUAL;
+
+    reiniciarControl();
+
+    Serial.println("MODO MANUAL ACTIVADO");
+  }
+
+  dirIzq = izq;
+  dirDer = der;
+
+  marchaHabilitada = true;
+
+  actualizarObjetivoManual();
+
+  Serial.println("MOVIMIENTO MANUAL");
+}
+
+void avanzar() {
+  mover(1, 1);
+}
+
+void retroceder() {
+  mover(-1, -1);
+}
+
+void izquierda() {
+  mover(-1, 1);
+}
+
+void derecha() {
+  mover(1, -1);
+}
+
+// =====================================
+// LECTURA DE LOS SENSORES
+// =====================================
+bool detectarLinea(int pin) {
+
+  bool estado = digitalRead(pin);
+
+  if (LINEA_BLANCA_HIGH) {
+    return estado == HIGH;
+  }
+  else {
+    return estado == LOW;
+  }
+}
+
+// =====================================
+// CALCULAR POSICION DE LA LINEA
+// =====================================
+bool leerPosicion(float &posicion) {
+
+  int suma = 0;
+  int cantidad = 0;
+
+  for (int i = 0; i < 5; i++) {
+
+    if (detectarLinea(sensores[i])) {
+
+      suma += pesos[i];
+      cantidad++;
+    }
+  }
+
+  if (cantidad == 0) {
+    return false;
+  }
+
+  posicion = (float)suma / cantidad;
+
+  return true;
+}
+
+// =====================================
+// MODO AUTOMATICO BASICO
+// SIN PID
+// =====================================
+void ejecutarAutomatico() {
+
+  if (modoActual != MODO_AUTOMATICO) return;
+
+  if (!marchaHabilitada) return;
+
+  float posicion = 0;
+
+  bool encontrada = leerPosicion(posicion);
+
+  // Si pierde la linea, detener
+  if (!encontrada) {
+
+    establecerObjetivos(0, 0);
+
+    return;
+  }
+
+  int base = escalar(velocidad);
+
+  int izquierda = base;
+  int derecha = base;
+
+  // Correcciones por reglas
+  if (posicion <= -1.5) {
+
+    // Giro fuerte izquierda
+    izquierda = 0;
+    derecha = base;
+  }
+  else if (posicion < -0.3) {
+
+    // Giro suave izquierda
+    izquierda = base * 55 / 100;
+    derecha = base;
+  }
+  else if (posicion >= 1.5) {
+
+    // Giro fuerte derecha
+    izquierda = base;
+    derecha = 0;
+  }
+  else if (posicion > 0.3) {
+
+    // Giro suave derecha
+    izquierda = base;
+    derecha = base * 55 / 100;
+  }
+
+  establecerObjetivos(izquierda, derecha);
+}
+
+// =====================================
+// MODO PID
+// =====================================
+void ejecutarPID() {
+
+  if (modoActual != MODO_PID) return;
+
+  if (!marchaHabilitada) return;
+
+  unsigned long ahora = millis();
+
+  if (ahora - ultimaLecturaControl < INTERVALO_CONTROL_MS)
+    return;
+
+  float dt = (ahora - ultimaLecturaControl) / 1000.0;
+
+  ultimaLecturaControl = ahora;
+
+  if (dt <= 0) return;
+
+  float posicion = 0;
+
+  bool encontrada = leerPosicion(posicion);
+
+  // Perdida de linea: detener motores
+  if (!encontrada) {
+
+    integralPID = 0;
+
+    establecerObjetivos(0, 0);
+
+    Serial.println("PID: LINEA PERDIDA");
+
+    return;
+  }
+
+  // Error respecto al centro
+  errorPID = posicion;
+
+  // Integral
+  integralPID += errorPID * dt;
+
+  integralPID = constrain(
+    integralPID,
+    -limiteIntegral,
+    limiteIntegral
+  );
+
+  // Derivada
+  derivadaPID =
+    (errorPID - errorAnterior) / dt;
+
+  // Salida PID
+  float correccion =
+      Kp * errorPID
+    + Ki * integralPID
+    + Kd * derivadaPID;
+
+  correccion = constrain(
+    correccion,
+    -limiteCorreccion,
+    limiteCorreccion
+  );
+
+  errorAnterior = errorPID;
+
+  // PWM base compartido
+  int base = escalar(velocidad);
+
+  // Correccion diferencial
+  int izquierda = base + (int)correccion;
+  int derecha = base - (int)correccion;
+
+  izquierda = constrain(izquierda, 0, 255);
+  derecha = constrain(derecha, 0, 255);
+
+  establecerObjetivos(izquierda, derecha);
+
+  // Informacion de prueba
+  Serial.print("PID ERROR: ");
+  Serial.print(errorPID);
+
+  Serial.print(" | CORRECCION: ");
+  Serial.print(correccion);
+
+  Serial.print(" | IZQ: ");
+  Serial.print(izquierda);
+
+  Serial.print(" | DER: ");
+  Serial.println(derecha);
+}
+
+// =====================================
+// BLUETOOTH - RECEPCION DE BYTES
+//
+// 1 = AVANZAR
+// 2 = RETROCEDER
+// 3 = IZQUIERDA
+// 4 = DERECHA
+// 5 = STOP
+// 8 = AUTOMATICO
+// 9 = PID
+// 10-100 = SLIDER PWM
+// =====================================
+void procesarByte(int b) {
+
+  switch (b) {
+
+    case 1:
+      avanzar();
+      break;
+
+    case 2:
+      retroceder();
+      break;
+
+    case 3:
+      izquierda();
+      break;
+
+    case 4:
+      derecha();
+      break;
+
+    case 5:
+      detener();
+      modoActual = MODO_MANUAL;
+      reiniciarControl();
+      Serial.println("STOP - MODO MANUAL");
+      break;
+
+    case 8:
+      activarAutomatico();
+      break;
+
+    case 9:
+      activarPID();
+      break;
+
+    default:
+
+      if (b >= 10 && b <= 100) {
+
+        cambiarVelocidad(
+          map(b, 10, 100, 0, 255)
+        );
+      }
+
+      break;
+  }
+}
+
+// =====================================
+// COMANDOS USB PARA PRUEBAS
+// =====================================
+void procesarComando(String comando) {
+
+  comando.trim();
+  comando.toUpperCase();
+
+  if (comando.length() == 0) return;
+
+  if (comando == "F") {
+    avanzar();
+  }
+  else if (comando == "B") {
+    retroceder();
+  }
+  else if (comando == "L") {
+    izquierda();
+  }
+  else if (comando == "R") {
+    derecha();
+  }
+  else if (comando == "S") {
+    detener();
+    modoActual = MODO_MANUAL;
+    reiniciarControl();
+  }
+  else if (comando == "A") {
+    activarAutomatico();
+  }
+  else if (comando == "P") {
+    activarPID();
+  }
+  else if (comando == "+") {
+    cambiarVelocidad(velocidad + 10);
+  }
+  else if (comando == "-") {
+    cambiarVelocidad(velocidad - 10);
+  }
+  else if (comando.startsWith("V")) {
+    cambiarVelocidad(comando.substring(1).toInt());
+  }
+  else if (comando == "?") {
+
+    Serial.println("COMANDOS USB:");
+    Serial.println("F = AVANZAR");
+    Serial.println("B = RETROCEDER");
+    Serial.println("L = IZQUIERDA");
+    Serial.println("R = DERECHA");
+    Serial.println("S = STOP");
+    Serial.println("A = AUTOMATICO");
+    Serial.println("P = PID");
+    Serial.println("V0-V255 = VELOCIDAD");
+    Serial.println("+ / - = AJUSTAR VELOCIDAD");
+  }
+  else {
+    Serial.println("COMANDO NO RECONOCIDO");
+  }
+}
+
+// =====================================
+// CONFIGURACION INICIAL
+// =====================================
+void setup() {
+
+  Serial.begin(115200);
+  Serial.setTimeout(20);
+
+  // Pines de motores
+  int pines[] = {
+    U1_AIN1, U1_AIN2,
+    U1_BIN1, U1_BIN2,
+    U2_AIN1, U2_AIN2,
+    U2_BIN1, U2_BIN2,
+    U1_STBY, U2_STBY
+  };
+
+  for (int i = 0; i < 10; i++) {
+
+    pinMode(pines[i], OUTPUT);
+    digitalWrite(pines[i], LOW);
+  }
+
+  // Sensores TCRT5000
+  for (int i = 0; i < 5; i++) {
+
+    pinMode(sensores[i], INPUT);
+  }
+
+  // PWM ESP32 Arduino Core 3.x
+  ledcAttach(U1_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U1_PWMB, PWM_FREQ, PWM_RES);
+
+  ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U2_PWMB, PWM_FREQ, PWM_RES);
+
+  digitalWrite(U1_STBY, HIGH);
+  digitalWrite(U2_STBY, HIGH);
+
+  detener();
+
+  // Bluetooth Classic
+  SerialBT.begin(NOMBRE_BT);
+
+  Serial.println("==============================");
+  Serial.println(" ROBOT ESP32 - 4 RUEDAS");
+  Serial.println(" MANUAL / AUTOMATICO / PID");
+  Serial.print(" Bluetooth: ");
+  Serial.println(NOMBRE_BT);
+  Serial.println("==============================");
+
+  Serial.println("1-5 = MOVIMIENTOS");
+  Serial.println("8 = AUTOMATICO");
+  Serial.println("9 = PID");
+  Serial.println("10-100 = PWM");
+}
+
+// =====================================
+// BUCLE PRINCIPAL
+// =====================================
+void loop() {
+
+  // Bluetooth
+  while (SerialBT.available()) {
+
+    int b = SerialBT.read();
+
+    procesarByte(b);
+  }
+
+  // USB
+  if (Serial.available()) {
+
+    String comando = Serial.readStringUntil('\n');
+
+    procesarComando(comando);
+  }
+
+  // Seguridad Bluetooth
+  static bool eraConectado = false;
+
+  bool conectado = SerialBT.hasClient();
+
+  if (eraConectado && !conectado) {
+
+    detener();
+
+    modoActual = MODO_MANUAL;
+
+    reiniciarControl();
+
+    Serial.println("BLUETOOTH DESCONECTADO: MOTORES DETENIDOS");
+  }
+
+  eraConectado = conectado;
+
+  // Ejecutar algoritmo correspondiente
+  if (modoActual == MODO_AUTOMATICO) {
+    ejecutarAutomatico();
+  }
+
+  else if (modoActual == MODO_PID) {
+    ejecutarPID();
+  }
+
+  // Actualizar rampa
+  actualizarRampa();
+}
