@@ -1,0 +1,330 @@
+
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+// =====================================
+// CONFIGURACION WIFI
+// =====================================
+const char* ssid = "Tasker";
+const char* password = "02052025";
+
+// =====================================
+// MODELO AI THINKER ESP32-CAM
+// =====================================
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// =====================================
+// SERVIDOR DE VIDEO
+// =====================================
+httpd_handle_t servidor = NULL;
+
+static const char* TIPO_CONTENIDO =
+  "multipart/x-mixed-replace;boundary=frame";
+
+static const char* LIMITE =
+  "\r\n--frame\r\n";
+
+static const char* CABECERA =
+  "Content-Type: image/jpeg\r\n"
+  "Content-Length: %u\r\n\r\n";
+
+// =====================================
+// TRANSMISION DE VIDEO
+// =====================================
+static esp_err_t transmitirVideo(httpd_req_t *req) {
+
+  camera_fb_t *fb = NULL;
+  esp_err_t resultado = ESP_OK;
+
+  char cabecera[64];
+
+  resultado = httpd_resp_set_type(req, TIPO_CONTENIDO);
+
+  if (resultado != ESP_OK) return resultado;
+
+  httpd_resp_set_hdr(
+    req,
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  while (true) {
+
+    fb = esp_camera_fb_get();
+
+    if (!fb) {
+      Serial.println("Error al capturar imagen");
+      resultado = ESP_FAIL;
+    }
+
+    else {
+
+      resultado = httpd_resp_send_chunk(
+        req,
+        LIMITE,
+        strlen(LIMITE)
+      );
+
+      if (resultado == ESP_OK) {
+
+        size_t longitud = snprintf(
+          cabecera,
+          sizeof(cabecera),
+          CABECERA,
+          fb->len
+        );
+
+        resultado = httpd_resp_send_chunk(
+          req,
+          cabecera,
+          longitud
+        );
+      }
+
+      if (resultado == ESP_OK) {
+
+        resultado = httpd_resp_send_chunk(
+          req,
+          (const char*)fb->buf,
+          fb->len
+        );
+      }
+
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    }
+
+    if (resultado != ESP_OK) break;
+  }
+
+  return resultado;
+}
+
+// =====================================
+// PAGINA PRINCIPAL
+// =====================================
+static esp_err_t paginaPrincipal(httpd_req_t *req) {
+
+  const char* html =
+    "<!DOCTYPE html>"
+    "<html>"
+    "<head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Robot Car - Camara</title>"
+    "<style>"
+    "body{background:#151515;color:white;text-align:center;font-family:Arial}"
+    "img{width:100%;max-width:800px;border-radius:10px}"
+    "h2{color:#00d084}"
+    "</style>"
+    "</head>"
+    "<body>"
+    "<h2>ROBOT CAR - CAMARA ESP32</h2>"
+    "<img src='/stream'>"
+    "<p>Transmision en tiempo real</p>"
+    "</body>"
+    "</html>";
+
+  httpd_resp_set_type(req, "text/html");
+
+  return httpd_resp_send(
+    req,
+    html,
+    HTTPD_RESP_USE_STRLEN
+  );
+}
+
+// =====================================
+// INICIAR SERVIDOR
+// =====================================
+void iniciarServidor() {
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+  config.server_port = 80;
+  config.ctrl_port = 32768;
+
+  httpd_uri_t rutaPrincipal = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = paginaPrincipal,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t rutaVideo = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = transmitirVideo,
+    .user_ctx = NULL
+  };
+
+  if (httpd_start(&servidor, &config) == ESP_OK) {
+
+    httpd_register_uri_handler(
+      servidor,
+      &rutaPrincipal
+    );
+
+    httpd_register_uri_handler(
+      servidor,
+      &rutaVideo
+    );
+
+    Serial.println("Servidor web iniciado");
+  }
+  else {
+    Serial.println("Error al iniciar servidor");
+  }
+}
+
+// =====================================
+// CONFIGURAR CAMARA
+// =====================================
+bool iniciarCamara() {
+
+  camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+
+  config.xclk_freq_hz = 20000000;
+
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  config.frame_size = FRAMESIZE_VGA;
+  config.jpeg_quality = 12;
+
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  if (psramFound()) {
+    Serial.println("PSRAM detectada");
+  }
+  else {
+    Serial.println("ADVERTENCIA: PSRAM no detectada");
+    config.fb_count = 1;
+    config.frame_size = FRAMESIZE_QVGA;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+  }
+
+  esp_err_t error = esp_camera_init(&config);
+
+  if (error != ESP_OK) {
+
+    Serial.printf(
+      "Error al iniciar camara: 0x%x\n",
+      error
+    );
+
+    return false;
+  }
+
+  sensor_t *sensor = esp_camera_sensor_get();
+
+  sensor->set_brightness(sensor, 0);
+  sensor->set_contrast(sensor, 0);
+  sensor->set_saturation(sensor, 0);
+
+  return true;
+}
+
+// =====================================
+// SETUP
+// =====================================
+void setup() {
+
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println(" ROBOT CAR - ESP32 CAM");
+  Serial.println("==============================");
+
+  // Iniciar camara
+  if (!iniciarCamara()) {
+
+    Serial.println("FALLO: revisar camara");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("Camara iniciada correctamente");
+
+  // Configurar WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Conectando a WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado");
+
+  Serial.print("Direccion IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Iniciar servidor
+  iniciarServidor();
+
+  Serial.println("==============================");
+  Serial.println("CAMARA LISTA");
+  Serial.print("ABRIR: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("==============================");
+}
+
+// =====================================
+// LOOP
+// =====================================
+void loop() {
+
+  delay(1000);
+}
