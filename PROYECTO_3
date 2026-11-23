@@ -1,9 +1,8 @@
-
 #include <Arduino.h>
 #include "BluetoothSerial.h"
 
 #if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth clasico no disponible: usa un ESP32 normal (no S2/S3/C3).
+#error Bluetooth clasico no disponible: usa un ESP32 normal.
 #endif
 
 BluetoothSerial SerialBT;
@@ -36,24 +35,20 @@ BluetoothSerial SerialBT;
 // =====================================
 // SENSORES TCRT5000 - 5 CANALES
 // =====================================
-#define S1 34
-#define S2 35
-#define S3 23
+#define S1 15
+#define S2 2
+#define S3 21
 #define S4 22
-#define S5 21
+#define S5 23
 
-const int sensores[5] = {
-  S1, S2, S3, S4, S5
-};
+const int sensores[5] = {S1, S2, S3, S4, S5};
 
-// true = HIGH detecta blanco
-// false = LOW detecta blanco
+// true = HIGH detecta la linea
+// false = LOW detecta la linea
 #define LINEA_BLANCA_HIGH true
 
 // Posiciones de los sensores
-const int pesos[5] = {
-  -2, -1, 0, 1, 2
-};
+const int pesos[5] = {-2, -1, 0, 1, 2};
 
 // =====================================
 // MODOS DE FUNCIONAMIENTO
@@ -73,19 +68,24 @@ bool marchaHabilitada = false;
 // =====================================
 #define PWM_FREQ 20000
 #define PWM_RES 8
+
 #define PWM_MIN 60
 
 #define PASO_RAMPA 10
 #define INTERVALO_RAMPA_MS 10
 
+// Velocidad base: 0 a 255
 int velocidad = 180;
 
+// Direcciones manuales
 int dirIzq = 0;
 int dirDer = 0;
 
+// Objetivos de los motores
 int objIzq = 0;
 int objDer = 0;
 
+// Velocidades actuales
 int actIzq = 0;
 int actDer = 0;
 
@@ -112,9 +112,53 @@ float derivadaPID = 0;
 float limiteIntegral = 10.0;
 float limiteCorreccion = 120.0;
 
+// Una rueda puede girar hacia atras hasta este PWM
+// cuando la correccion es muy fuerte (curvas cerradas)
+#define PWM_REVERSA_MAX 100
+
 unsigned long ultimaLecturaControl = 0;
 
 #define INTERVALO_CONTROL_MS 10
+
+// =====================================
+// CONFIGURACION DE ESQUINAS / CURVAS CERRADAS
+// =====================================
+
+// PWM usado al pivotar (giro sobre su eje).
+// Se toma de la velocidad base pero limitado a este rango,
+// porque un robot de 4 ruedas necesita mas fuerza para pivotar.
+#define PWM_GIRO_MIN 110
+#define PWM_GIRO_MAX 200
+
+// Cantidad minima de sensores activos para considerar
+// que hay una esquina (con un sensor extremo activo)
+#define ESQUINA_MIN_SENSORES 3
+
+// Avance corto antes de pivotar, para que el eje de las
+// ruedas quede sobre la esquina (los sensores van adelante).
+// Ajusta segun la distancia sensor-eje: 0 a 80 ms.
+#define AVANCE_ESQUINA_MS 30
+
+// Tiempo maximo de un giro de esquina
+#define GIRO_MAX_MS 1200
+
+// Tiempo maximo buscando la linea perdida antes de detenerse
+#define PERDIDA_MAX_MS 1500
+
+enum EstadoSeguimiento {
+  SEG_SEGUIR,
+  SEG_ESQ_AVANZAR,
+  SEG_ESQ_SALIR,
+  SEG_ESQ_ENTRAR,
+  SEG_BUSCAR
+};
+
+EstadoSeguimiento estadoSeg = SEG_SEGUIR;
+
+int ladoGiro = 0;        // -1 izquierda, 1 derecha
+int ultimoLado = 0;      // ultimo lado donde estuvo la linea
+unsigned long inicioEstado = 0;
+unsigned long perdidaDesde = 0;
 
 // =====================================
 // ESCALA DE VELOCIDAD
@@ -126,6 +170,21 @@ int escalar(int v) {
   if (v == 0) return 0;
 
   return map(v, 1, 255, PWM_MIN, 255);
+}
+
+// Asegura el PWM minimo cuando un motor
+// debe girar, sin modificar los valores cero.
+int limitarPWM(int valor) {
+
+  valor = constrain(valor, -255, 255);
+
+  if (valor > 0 && valor < PWM_MIN)
+    return PWM_MIN;
+
+  if (valor < 0 && valor > -PWM_MIN)
+    return -PWM_MIN;
+
+  return valor;
 }
 
 // =====================================
@@ -192,8 +251,8 @@ void aplicarMotores(int izquierda, int derecha) {
 // =====================================
 void establecerObjetivos(int izquierda, int derecha) {
 
-  objIzq = constrain(izquierda, -255, 255);
-  objDer = constrain(derecha, -255, 255);
+  objIzq = limitarPWM(izquierda);
+  objDer = limitarPWM(derecha);
 }
 
 void actualizarObjetivoManual() {
@@ -213,6 +272,7 @@ void actualizarObjetivoManual() {
 
 // =====================================
 // RAMPA DE ACELERACION
+// (solo se usa en modo manual)
 // =====================================
 int acercar(int actual, int objetivo) {
 
@@ -227,6 +287,12 @@ int acercar(int actual, int objetivo) {
     return (objetivo > 0) ? arranque : -arranque;
   }
 
+  // Si cambia el sentido, primero detener
+  if ((actual > 0 && objetivo < 0) ||
+      (actual < 0 && objetivo > 0)) {
+    objetivo = 0;
+  }
+
   if (actual < objetivo)
     return min(actual + PASO_RAMPA, objetivo);
 
@@ -237,6 +303,22 @@ int acercar(int actual, int objetivo) {
 }
 
 void actualizarRampa() {
+
+  // En AUTOMATICO y PID la correccion debe aplicarse
+  // al instante: la rampa retrasaba las curvas y
+  // obligaba a frenar al invertir una rueda.
+  if (modoActual != MODO_MANUAL) {
+
+    if (objIzq != actIzq || objDer != actDer) {
+
+      actIzq = objIzq;
+      actDer = objDer;
+
+      aplicarMotores(actIzq, actDer);
+    }
+
+    return;
+  }
 
   if (millis() - ultimaRampa < INTERVALO_RAMPA_MS)
     return;
@@ -264,6 +346,10 @@ void reiniciarControl() {
   errorAnterior = 0;
   integralPID = 0;
   derivadaPID = 0;
+
+  estadoSeg = SEG_SEGUIR;
+  ladoGiro = 0;
+  ultimoLado = 0;
 
   ultimaLecturaControl = millis();
 }
@@ -338,8 +424,6 @@ void activarPID() {
 // =====================================
 void mover(int izq, int der) {
 
-  // Si venimos de automatico o PID,
-  // cambiar al modo manual
   if (modoActual != MODO_MANUAL) {
 
     detener();
@@ -392,25 +476,36 @@ bool detectarLinea(int pin) {
   }
 }
 
-// =====================================
-// CALCULAR POSICION DE LA LINEA
-// =====================================
-bool leerPosicion(float &posicion) {
+// Lee los 5 sensores una sola vez por ciclo.
+// Devuelve la cantidad de sensores sobre la linea.
+int leerSensores(bool s[5]) {
 
-  int suma = 0;
   int cantidad = 0;
 
   for (int i = 0; i < 5; i++) {
 
-    if (detectarLinea(sensores[i])) {
+    s[i] = detectarLinea(sensores[i]);
 
-      suma += pesos[i];
-      cantidad++;
-    }
+    if (s[i]) cantidad++;
   }
 
+  return cantidad;
+}
+
+// =====================================
+// CALCULAR POSICION DE LA LINEA
+// =====================================
+bool calcularPosicion(const bool s[5], int cantidad, float &posicion) {
+
   if (cantidad == 0) {
+    posicion = 0;
     return false;
+  }
+
+  int suma = 0;
+
+  for (int i = 0; i < 5; i++) {
+    if (s[i]) suma += pesos[i];
   }
 
   posicion = (float)suma / cantidad;
@@ -419,8 +514,184 @@ bool leerPosicion(float &posicion) {
 }
 
 // =====================================
+// GIRO SOBRE SU EJE
+// lado: -1 = izquierda, 1 = derecha
+// =====================================
+void pivotar(int lado, int vel) {
+
+  if (lado < 0) {
+    establecerObjetivos(-vel, vel);
+  }
+  else {
+    establecerObjetivos(vel, -vel);
+  }
+}
+
+void cambiarEstadoSeg(EstadoSeguimiento nuevo) {
+
+  estadoSeg = nuevo;
+  inicioEstado = millis();
+
+  switch (nuevo) {
+    case SEG_SEGUIR:      Serial.println("SEG: SEGUIR LINEA"); break;
+    case SEG_ESQ_AVANZAR: Serial.println("SEG: ESQUINA - AVANZAR"); break;
+    case SEG_ESQ_SALIR:   Serial.println("SEG: ESQUINA - GIRANDO"); break;
+    case SEG_ESQ_ENTRAR:  Serial.println("SEG: ESQUINA - BUSCANDO LINEA"); break;
+    case SEG_BUSCAR:      Serial.println("SEG: LINEA PERDIDA - BUSCANDO"); break;
+  }
+}
+
+void reanudarSeguimiento(float posicion) {
+
+  integralPID = 0;
+  derivadaPID = 0;
+  errorAnterior = posicion;
+
+  cambiarEstadoSeg(SEG_SEGUIR);
+}
+
+// =====================================
+// GESTION DE ESQUINAS Y LINEA PERDIDA
+//
+// Devuelve true si esta funcion se encargo
+// de los motores en este ciclo (esquina o
+// busqueda). Devuelve false si se debe seguir
+// la linea normalmente (reglas o PID).
+//
+// Casos que resuelve:
+//  - Esquina de 90 grados: varios sensores activos
+//    incluyendo un extremo (S1 o S5) -> avanza un
+//    poco y pivota hasta encontrar la nueva linea.
+//  - Linea perdida: en lugar de detenerse, pivota
+//    hacia el ultimo lado donde vio la linea.
+// =====================================
+bool gestionarGiros(const bool s[5], int n, float pos, int base) {
+
+  unsigned long ahora = millis();
+
+  int velGiro = constrain(base, PWM_GIRO_MIN, PWM_GIRO_MAX);
+
+  // Recordar de que lado estaba la linea
+  if (n > 0) {
+
+    if (s[0] && !s[4]) ultimoLado = -1;
+    else if (s[4] && !s[0]) ultimoLado = 1;
+    else if (pos <= -0.7) ultimoLado = -1;
+    else if (pos >= 0.7) ultimoLado = 1;
+  }
+
+  switch (estadoSeg) {
+
+    // ---------------------------------
+    case SEG_SEGUIR:
+
+      // Linea perdida: buscar hacia el ultimo lado
+      if (n == 0) {
+
+        ladoGiro = (ultimoLado != 0) ? ultimoLado : 1;
+        perdidaDesde = ahora;
+
+        cambiarEstadoSeg(SEG_BUSCAR);
+        pivotar(ladoGiro, velGiro);
+
+        return true;
+      }
+
+      // Esquina a la izquierda
+      if (n >= ESQUINA_MIN_SENSORES && s[0] && !s[4]) {
+
+        ladoGiro = -1;
+        cambiarEstadoSeg(SEG_ESQ_AVANZAR);
+        establecerObjetivos(base, base);
+
+        return true;
+      }
+
+      // Esquina a la derecha
+      if (n >= ESQUINA_MIN_SENSORES && s[4] && !s[0]) {
+
+        ladoGiro = 1;
+        cambiarEstadoSeg(SEG_ESQ_AVANZAR);
+        establecerObjetivos(base, base);
+
+        return true;
+      }
+
+      return false;
+
+    // ---------------------------------
+    case SEG_ESQ_AVANZAR:
+
+      establecerObjetivos(base, base);
+
+      if (ahora - inicioEstado >= AVANCE_ESQUINA_MS) {
+        cambiarEstadoSeg(SEG_ESQ_SALIR);
+      }
+
+      return true;
+
+    // ---------------------------------
+    // Pivotar hasta que el sensor central
+    // abandone la linea vieja
+    case SEG_ESQ_SALIR:
+
+      pivotar(ladoGiro, velGiro);
+
+      if (!s[2]) {
+        cambiarEstadoSeg(SEG_ESQ_ENTRAR);
+      }
+      else if (ahora - inicioEstado >= GIRO_MAX_MS) {
+        perdidaDesde = ahora;
+        cambiarEstadoSeg(SEG_BUSCAR);
+      }
+
+      return true;
+
+    // ---------------------------------
+    // Seguir pivotando hasta que el sensor
+    // central encuentre la linea nueva
+    case SEG_ESQ_ENTRAR:
+
+      pivotar(ladoGiro, velGiro);
+
+      if (s[2]) {
+        reanudarSeguimiento(pos);
+        return false;
+      }
+
+      if (ahora - inicioEstado >= GIRO_MAX_MS) {
+        perdidaDesde = ahora;
+        cambiarEstadoSeg(SEG_BUSCAR);
+      }
+
+      return true;
+
+    // ---------------------------------
+    case SEG_BUSCAR:
+
+      if (n > 0) {
+        reanudarSeguimiento(pos);
+        return false;
+      }
+
+      if (ahora - perdidaDesde > PERDIDA_MAX_MS) {
+        // No la encontro: detener (se reanuda sola
+        // si la linea vuelve a aparecer)
+        establecerObjetivos(0, 0);
+        return true;
+      }
+
+      pivotar(ladoGiro, velGiro);
+
+      return true;
+  }
+
+  return false;
+}
+
+// =====================================
 // MODO AUTOMATICO BASICO
-// SIN PID
+// SIN PID (por reglas)
 // =====================================
 void ejecutarAutomatico() {
 
@@ -428,28 +699,26 @@ void ejecutarAutomatico() {
 
   if (!marchaHabilitada) return;
 
+  bool s[5];
+  int n = leerSensores(s);
+
   float posicion = 0;
-
-  bool encontrada = leerPosicion(posicion);
-
-  // Si pierde la linea, detener
-  if (!encontrada) {
-
-    establecerObjetivos(0, 0);
-
-    return;
-  }
+  bool encontrada = calcularPosicion(s, n, posicion);
 
   int base = escalar(velocidad);
+
+  // Esquinas y linea perdida
+  if (gestionarGiros(s, n, posicion, base)) return;
+
+  if (!encontrada) return;
 
   int izquierda = base;
   int derecha = base;
 
-  // Correcciones por reglas
   if (posicion <= -1.5) {
 
-    // Giro fuerte izquierda
-    izquierda = 0;
+    // Giro fuerte izquierda: rueda interna hacia atras
+    izquierda = -base * 35 / 100;
     derecha = base;
   }
   else if (posicion < -0.3) {
@@ -460,9 +729,9 @@ void ejecutarAutomatico() {
   }
   else if (posicion >= 1.5) {
 
-    // Giro fuerte derecha
+    // Giro fuerte derecha: rueda interna hacia atras
     izquierda = base;
-    derecha = 0;
+    derecha = -base * 35 / 100;
   }
   else if (posicion > 0.3) {
 
@@ -494,21 +763,18 @@ void ejecutarPID() {
 
   if (dt <= 0) return;
 
+  bool s[5];
+  int n = leerSensores(s);
+
   float posicion = 0;
+  bool encontrada = calcularPosicion(s, n, posicion);
 
-  bool encontrada = leerPosicion(posicion);
+  int base = escalar(velocidad);
 
-  // Perdida de linea: detener motores
-  if (!encontrada) {
+  // Esquinas y linea perdida
+  if (gestionarGiros(s, n, posicion, base)) return;
 
-    integralPID = 0;
-
-    establecerObjetivos(0, 0);
-
-    Serial.println("PID: LINEA PERDIDA");
-
-    return;
-  }
+  if (!encontrada) return;
 
   // Error respecto al centro
   errorPID = posicion;
@@ -540,30 +806,36 @@ void ejecutarPID() {
 
   errorAnterior = errorPID;
 
-  // PWM base compartido
-  int base = escalar(velocidad);
-
   // Correccion diferencial
   int izquierda = base + (int)correccion;
   int derecha = base - (int)correccion;
 
-  izquierda = constrain(izquierda, 0, 255);
-  derecha = constrain(derecha, 0, 255);
+  // Permite que la rueda interna retroceda un poco
+  // en curvas muy cerradas
+  izquierda = constrain(izquierda, -PWM_REVERSA_MAX, 255);
+  derecha = constrain(derecha, -PWM_REVERSA_MAX, 255);
 
   establecerObjetivos(izquierda, derecha);
 
-  // Informacion de prueba
-  Serial.print("PID ERROR: ");
-  Serial.print(errorPID);
+  // Informacion de prueba cada 200 ms
+  static unsigned long ultimaImpresionPID = 0;
 
-  Serial.print(" | CORRECCION: ");
-  Serial.print(correccion);
+  if (millis() - ultimaImpresionPID >= 200) {
 
-  Serial.print(" | IZQ: ");
-  Serial.print(izquierda);
+    ultimaImpresionPID = millis();
 
-  Serial.print(" | DER: ");
-  Serial.println(derecha);
+    Serial.print("PID ERROR: ");
+    Serial.print(errorPID);
+
+    Serial.print(" | CORRECCION: ");
+    Serial.print(correccion);
+
+    Serial.print(" | IZQ: ");
+    Serial.print(izquierda);
+
+    Serial.print(" | DER: ");
+    Serial.println(derecha);
+  }
 }
 
 // =====================================
@@ -711,7 +983,6 @@ void setup() {
 
   // Sensores TCRT5000
   for (int i = 0; i < 5; i++) {
-
     pinMode(sensores[i], INPUT);
   }
 
@@ -722,6 +993,7 @@ void setup() {
   ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
   ledcAttach(U2_PWMB, PWM_FREQ, PWM_RES);
 
+  // Habilitar controladores
   digitalWrite(U1_STBY, HIGH);
   digitalWrite(U2_STBY, HIGH);
 
@@ -786,11 +1058,10 @@ void loop() {
   if (modoActual == MODO_AUTOMATICO) {
     ejecutarAutomatico();
   }
-
   else if (modoActual == MODO_PID) {
     ejecutarPID();
   }
 
-  // Actualizar rampa
+  // Aplicar objetivos a los motores
   actualizarRampa();
 }
