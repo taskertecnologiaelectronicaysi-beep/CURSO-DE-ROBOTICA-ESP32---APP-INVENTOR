@@ -1,269 +1,495 @@
 
-#include "esp_camera.h"
-#include <WiFi.h>
-#include "esp_http_server.h"
+
+#include <Arduino.h>
+#include "BluetoothSerial.h"
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth clasico no disponible: usa ESP32 normal.
+#endif
+
+BluetoothSerial SerialBT;
+
+#define NOMBRE_BT "RobotCar"
 
 // =====================================
-// CONFIGURACION WIFI
+// TB6612FNG - U1
 // =====================================
-const char* ssid = "Tasker";
-const char* password = "02052025";
+#define U1_PWMA 32
+#define U1_AIN1 25
+#define U1_AIN2 33
+#define U1_STBY 26
 
-// =====================================
-// MODELO AI THINKER ESP32-CAM
-// =====================================
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+#define U1_PWMB 12
+#define U1_BIN1 27
+#define U1_BIN2 14
 
 // =====================================
-// SERVIDOR DE VIDEO
+// TB6612FNG - U2
 // =====================================
-httpd_handle_t servidor = NULL;
+#define U2_PWMA 0
+#define U2_AIN1 16
+#define U2_AIN2 4
+#define U2_STBY 17
 
-static const char* TIPO_CONTENIDO =
-  "multipart/x-mixed-replace;boundary=frame";
-
-static const char* LIMITE =
-  "\r\n--frame\r\n";
-
-static const char* CABECERA =
-  "Content-Type: image/jpeg\r\n"
-  "Content-Length: %u\r\n\r\n";
+#define U2_PWMB 19
+#define U2_BIN1 5
+#define U2_BIN2 18
 
 // =====================================
-// TRANSMISION DE VIDEO
+// HC-SR04
 // =====================================
-static esp_err_t transmitirVideo(httpd_req_t *req) {
+#define TRIG_PIN 21
+#define ECHO_PIN 22
 
-  camera_fb_t *fb = NULL;
-  esp_err_t resultado = ESP_OK;
+#define INTERVALO_SENSOR_US 60000
+#define INTERVALO_BT_MS 250
+#define TIEMPO_SIN_ECO_MS 500
 
-  char cabecera[64];
+volatile uint32_t inicioEcho = 0;
+volatile uint32_t duracionEcho = 0;
+volatile bool ecoDisponible = false;
 
-  resultado = httpd_resp_set_type(req, TIPO_CONTENIDO);
+portMUX_TYPE muxEcho = portMUX_INITIALIZER_UNLOCKED;
 
-  if (resultado != ESP_OK) return resultado;
+int distanciaCM = -1;
 
-  httpd_resp_set_hdr(
-    req,
-    "Access-Control-Allow-Origin",
-    "*"
+unsigned long ultimaMedicion = 0;
+unsigned long ultimoDatoBT = 0;
+unsigned long ultimoEcoValido = 0;
+
+bool trigActivo = false;
+uint32_t inicioTrig = 0;
+
+// =====================================
+// CONFIGURACION PWM
+// =====================================
+#define PWM_FREQ 20000
+#define PWM_RES 8
+#define PWM_MIN 60
+
+#define PASO_RAMPA 10
+#define INTERVALO_RAMPA_MS 10
+
+int velocidad = 180;
+
+int dirIzq = 0;
+int dirDer = 0;
+
+int objIzq = 0, objDer = 0;
+int actIzq = 0, actDer = 0;
+
+unsigned long ultimaRampa = 0;
+
+// Inversion de motores
+bool invM1A = false;
+bool invM1B = false;
+bool invM2A = false;
+bool invM2B = false;
+
+// =====================================
+// ESCALA DE VELOCIDAD
+// =====================================
+int escalar(int v) {
+
+  v = constrain(v, 0, 255);
+
+  if (v == 0) return 0;
+
+  return map(v, 1, 255, PWM_MIN, 255);
+}
+
+// =====================================
+// CONTROL DE MOTORES
+// =====================================
+void controlarMotor(int pwm, int in1, int in2,
+                    int valor, bool invertir) {
+
+  if (invertir) valor = -valor;
+
+  valor = constrain(valor, -255, 255);
+
+  if (valor > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  }
+
+  else if (valor < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  }
+
+  else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  ledcWrite(pwm, abs(valor));
+}
+
+void aplicarMotores(int izquierda, int derecha) {
+
+  controlarMotor(U1_PWMA, U1_AIN1, U1_AIN2,
+                 izquierda, invM1A);
+
+  controlarMotor(U2_PWMA, U2_AIN1, U2_AIN2,
+                 izquierda, invM2A);
+
+  controlarMotor(U1_PWMB, U1_BIN1, U1_BIN2,
+                 derecha, invM1B);
+
+  controlarMotor(U2_PWMB, U2_BIN1, U2_BIN2,
+                 derecha, invM2B);
+}
+
+// =====================================
+// OBJETIVO Y RAMPA
+// =====================================
+void actualizarObjetivo() {
+
+  int pwm = escalar(velocidad);
+
+  objIzq = dirIzq * pwm;
+  objDer = dirDer * pwm;
+}
+
+int acercar(int actual, int objetivo) {
+
+  if (actual == 0 && objetivo != 0) {
+
+    int arranque = min(abs(objetivo), (int)PWM_MIN);
+
+    return (objetivo > 0) ? arranque : -arranque;
+  }
+
+  if (actual < objetivo)
+    return min(actual + PASO_RAMPA, objetivo);
+
+  if (actual > objetivo)
+    return max(actual - PASO_RAMPA, objetivo);
+
+  return actual;
+}
+
+void actualizarRampa() {
+
+  if (millis() - ultimaRampa < INTERVALO_RAMPA_MS)
+    return;
+
+  ultimaRampa = millis();
+
+  int nuevoIzq = acercar(actIzq, objIzq);
+  int nuevoDer = acercar(actDer, objDer);
+
+  if (nuevoIzq != actIzq || nuevoDer != actDer) {
+
+    actIzq = nuevoIzq;
+    actDer = nuevoDer;
+
+    aplicarMotores(actIzq, actDer);
+  }
+}
+
+// =====================================
+// MOVIMIENTOS
+// =====================================
+void mover(int izq, int der) {
+
+  dirIzq = izq;
+  dirDer = der;
+
+  actualizarObjetivo();
+
+  Serial.print("[VELOCIDAD=");
+  Serial.print(velocidad);
+  Serial.print(" PWM OBJETIVO=");
+  Serial.print(abs(objIzq));
+  Serial.println("]");
+}
+
+void avanzar() {
+  mover(1, 1);
+}
+
+void retroceder() {
+  mover(-1, -1);
+}
+
+void izquierda() {
+  mover(-1, 1);
+}
+
+void derecha() {
+  mover(1, -1);
+}
+
+// =====================================
+// DETENER MOTORES
+// =====================================
+void detener() {
+
+  dirIzq = dirDer = 0;
+
+  objIzq = objDer = 0;
+
+  actIzq = actDer = 0;
+
+  aplicarMotores(0, 0);
+}
+
+// =====================================
+// CAMBIAR VELOCIDAD
+// =====================================
+void cambiarVelocidad(int nueva) {
+
+  velocidad = constrain(nueva, 0, 255);
+
+  actualizarObjetivo();
+
+  Serial.print("VELOCIDAD: ");
+  Serial.print(velocidad);
+
+  Serial.print(" (PWM REAL: ");
+  Serial.print(escalar(velocidad));
+  Serial.println(")");
+}
+
+// =====================================
+// HC-SR04 - INTERRUPCION ECHO
+// =====================================
+void IRAM_ATTR detectarEcho() {
+
+  uint32_t ahora = micros();
+
+  portENTER_CRITICAL_ISR(&muxEcho);
+
+  if (digitalRead(ECHO_PIN) == HIGH) {
+
+    inicioEcho = ahora;
+  }
+
+  else {
+
+    duracionEcho = ahora - inicioEcho;
+    ecoDisponible = true;
+  }
+
+  portEXIT_CRITICAL_ISR(&muxEcho);
+}
+
+// =====================================
+// GENERAR PULSO TRIGGER
+// =====================================
+void actualizarTrigger() {
+
+  uint32_t ahora = micros();
+
+  if (!trigActivo) {
+
+    if (ahora - ultimaMedicion >= INTERVALO_SENSOR_US) {
+
+      ultimaMedicion = ahora;
+
+      portENTER_CRITICAL(&muxEcho);
+      ecoDisponible = false;
+      portEXIT_CRITICAL(&muxEcho);
+
+      digitalWrite(TRIG_PIN, HIGH);
+
+      inicioTrig = ahora;
+      trigActivo = true;
+    }
+  }
+
+  else if (ahora - inicioTrig >= 10) {
+
+    digitalWrite(TRIG_PIN, LOW);
+
+    trigActivo = false;
+  }
+}
+
+// =====================================
+// PROCESAR DISTANCIA
+// =====================================
+void actualizarDistancia() {
+
+  uint32_t duracion = 0;
+  bool nuevoEco = false;
+
+  portENTER_CRITICAL(&muxEcho);
+
+  if (ecoDisponible) {
+
+    duracion = duracionEcho;
+    ecoDisponible = false;
+    nuevoEco = true;
+  }
+
+  portEXIT_CRITICAL(&muxEcho);
+
+  if (nuevoEco) {
+
+    int nuevaDistancia = (int)(duracion * 0.0343 / 2.0);
+
+    if (nuevaDistancia >= 2 && nuevaDistancia <= 400) {
+
+      distanciaCM = nuevaDistancia;
+      ultimoEcoValido = millis();
+    }
+  }
+
+  if (millis() - ultimoEcoValido > TIEMPO_SIN_ECO_MS) {
+
+    distanciaCM = -1;
+  }
+}
+
+// =====================================
+// ENVIAR DISTANCIA POR BLUETOOTH
+// =====================================
+void enviarDistancia() {
+
+  if (millis() - ultimoDatoBT < INTERVALO_BT_MS)
+    return;
+
+  ultimoDatoBT = millis();
+
+  char mensaje[16];
+
+  snprintf(
+    mensaje,
+    sizeof(mensaje),
+    "D:%d",
+    distanciaCM
   );
 
-  while (true) {
+  if (SerialBT.hasClient()) {
 
-    fb = esp_camera_fb_get();
+    SerialBT.println(mensaje);
+  }
 
-    if (!fb) {
-      Serial.println("Error al capturar imagen");
-      resultado = ESP_FAIL;
+  static int ultimaDistanciaUSB = -999;
+
+  if (distanciaCM != ultimaDistanciaUSB) {
+
+    Serial.print("DISTANCIA: ");
+
+    if (distanciaCM >= 0) {
+      Serial.print(distanciaCM);
+      Serial.println(" cm");
     }
-
     else {
-
-      resultado = httpd_resp_send_chunk(
-        req,
-        LIMITE,
-        strlen(LIMITE)
-      );
-
-      if (resultado == ESP_OK) {
-
-        size_t longitud = snprintf(
-          cabecera,
-          sizeof(cabecera),
-          CABECERA,
-          fb->len
-        );
-
-        resultado = httpd_resp_send_chunk(
-          req,
-          cabecera,
-          longitud
-        );
-      }
-
-      if (resultado == ESP_OK) {
-
-        resultado = httpd_resp_send_chunk(
-          req,
-          (const char*)fb->buf,
-          fb->len
-        );
-      }
-
-      esp_camera_fb_return(fb);
-      fb = NULL;
+      Serial.println("SIN ECO");
     }
 
-    if (resultado != ESP_OK) break;
+    ultimaDistanciaUSB = distanciaCM;
   }
-
-  return resultado;
 }
 
 // =====================================
-// PAGINA PRINCIPAL
+// RECEPCION BLUETOOTH
 // =====================================
-static esp_err_t paginaPrincipal(httpd_req_t *req) {
+void procesarByte(int b) {
 
-  const char* html =
-    "<!DOCTYPE html>"
-    "<html>"
-    "<head>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>Robot Car - Camara</title>"
-    "<style>"
-    "body{background:#151515;color:white;text-align:center;font-family:Arial}"
-    "img{width:100%;max-width:800px;border-radius:10px}"
-    "h2{color:#00d084}"
-    "</style>"
-    "</head>"
-    "<body>"
-    "<h2>ROBOT CAR - CAMARA ESP32</h2>"
-    "<img src='/stream'>"
-    "<p>Transmision en tiempo real</p>"
-    "</body>"
-    "</html>";
+  switch (b) {
 
-  httpd_resp_set_type(req, "text/html");
+    case 1:
+      avanzar();
+      Serial.println("AVANZANDO");
+      break;
 
-  return httpd_resp_send(
-    req,
-    html,
-    HTTPD_RESP_USE_STRLEN
-  );
+    case 2:
+      retroceder();
+      Serial.println("RETROCEDIENDO");
+      break;
+
+    case 3:
+      izquierda();
+      Serial.println("GIRANDO IZQUIERDA");
+      break;
+
+    case 4:
+      derecha();
+      Serial.println("GIRANDO DERECHA");
+      break;
+
+    case 5:
+      detener();
+      Serial.println("MOTORES DETENIDOS");
+      break;
+
+    default:
+
+      if (b >= 10 && b <= 100) {
+
+        cambiarVelocidad(map(b, 0, 100, 0, 255));
+      }
+
+      break;
+  }
 }
 
 // =====================================
-// INICIAR SERVIDOR
+// COMANDOS USB
 // =====================================
-void iniciarServidor() {
+void procesarComando(String comando) {
 
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  comando.trim();
+  comando.toUpperCase();
 
-  config.server_port = 80;
-  config.ctrl_port = 32768;
+  if (comando.length() == 0) return;
 
-  httpd_uri_t rutaPrincipal = {
-    .uri = "/",
-    .method = HTTP_GET,
-    .handler = paginaPrincipal,
-    .user_ctx = NULL
-  };
-
-  httpd_uri_t rutaVideo = {
-    .uri = "/stream",
-    .method = HTTP_GET,
-    .handler = transmitirVideo,
-    .user_ctx = NULL
-  };
-
-  if (httpd_start(&servidor, &config) == ESP_OK) {
-
-    httpd_register_uri_handler(
-      servidor,
-      &rutaPrincipal
-    );
-
-    httpd_register_uri_handler(
-      servidor,
-      &rutaVideo
-    );
-
-    Serial.println("Servidor web iniciado");
+  if (comando == "F") {
+    avanzar();
+    Serial.println("AVANZANDO");
   }
+
+  else if (comando == "B") {
+    retroceder();
+    Serial.println("RETROCEDIENDO");
+  }
+
+  else if (comando == "L") {
+    izquierda();
+    Serial.println("GIRANDO IZQUIERDA");
+  }
+
+  else if (comando == "R") {
+    derecha();
+    Serial.println("GIRANDO DERECHA");
+  }
+
+  else if (comando == "S") {
+    detener();
+    Serial.println("MOTORES DETENIDOS");
+  }
+
+  else if (comando == "+") {
+    cambiarVelocidad(velocidad + 10);
+  }
+
+  else if (comando == "-") {
+    cambiarVelocidad(velocidad - 10);
+  }
+
+  else if (comando.startsWith("V")) {
+    cambiarVelocidad(comando.substring(1).toInt());
+  }
+
+  else if (comando == "?") {
+
+    Serial.println("F = AVANZAR");
+    Serial.println("B = RETROCEDER");
+    Serial.println("L = IZQUIERDA");
+    Serial.println("R = DERECHA");
+    Serial.println("S = STOP");
+    Serial.println("V0-V255 = VELOCIDAD");
+    Serial.println("+ / - = AJUSTAR VELOCIDAD");
+  }
+
   else {
-    Serial.println("Error al iniciar servidor");
+    Serial.println("COMANDO NO RECONOCIDO");
   }
-}
-
-// =====================================
-// CONFIGURAR CAMARA
-// =====================================
-bool iniciarCamara() {
-
-  camera_config_t config;
-
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-  config.xclk_freq_hz = 20000000;
-
-  config.pixel_format = PIXFORMAT_JPEG;
-
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
-
-  config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-
-  if (psramFound()) {
-    Serial.println("PSRAM detectada");
-  }
-  else {
-    Serial.println("ADVERTENCIA: PSRAM no detectada");
-    config.fb_count = 1;
-    config.frame_size = FRAMESIZE_QVGA;
-    config.fb_location = CAMERA_FB_IN_DRAM;
-  }
-
-  esp_err_t error = esp_camera_init(&config);
-
-  if (error != ESP_OK) {
-
-    Serial.printf(
-      "Error al iniciar camara: 0x%x\n",
-      error
-    );
-
-    return false;
-  }
-
-  sensor_t *sensor = esp_camera_sensor_get();
-
-  sensor->set_brightness(sensor, 0);
-  sensor->set_contrast(sensor, 0);
-  sensor->set_saturation(sensor, 0);
-
-  return true;
 }
 
 // =====================================
@@ -272,52 +498,60 @@ bool iniciarCamara() {
 void setup() {
 
   Serial.begin(115200);
-  delay(1000);
+  Serial.setTimeout(20);
 
-  Serial.println();
-  Serial.println("==============================");
-  Serial.println(" ROBOT CAR - ESP32 CAM");
-  Serial.println("==============================");
+  int pines[] = {
+    U1_AIN1, U1_AIN2,
+    U1_BIN1, U1_BIN2,
+    U2_AIN1, U2_AIN2,
+    U2_BIN1, U2_BIN2,
+    U1_STBY, U2_STBY
+  };
 
-  // Iniciar camara
-  if (!iniciarCamara()) {
+  for (int i = 0; i < 10; i++) {
 
-    Serial.println("FALLO: revisar camara");
-
-    while (true) {
-      delay(1000);
-    }
+    pinMode(pines[i], OUTPUT);
+    digitalWrite(pines[i], LOW);
   }
 
-  Serial.println("Camara iniciada correctamente");
+  ledcAttach(U1_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U1_PWMB, PWM_FREQ, PWM_RES);
 
-  // Configurar WiFi
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
+  ledcAttach(U2_PWMA, PWM_FREQ, PWM_RES);
+  ledcAttach(U2_PWMB, PWM_FREQ, PWM_RES);
 
-  WiFi.begin(ssid, password);
+  digitalWrite(U1_STBY, HIGH);
+  digitalWrite(U2_STBY, HIGH);
 
-  Serial.print("Conectando a WiFi");
+  detener();
 
-  while (WiFi.status() != WL_CONNECTED) {
+  // HC-SR04
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
-    delay(500);
-    Serial.print(".");
-  }
+  digitalWrite(TRIG_PIN, LOW);
 
-  Serial.println();
-  Serial.println("WiFi conectado");
+  attachInterrupt(
+    digitalPinToInterrupt(ECHO_PIN),
+    detectarEcho,
+    CHANGE
+  );
 
-  Serial.print("Direccion IP: ");
-  Serial.println(WiFi.localIP());
+  ultimaMedicion = micros();
+  ultimoEcoValido = millis();
 
-  // Iniciar servidor
-  iniciarServidor();
+  Serial.println("HC-SR04 iniciado");
+  Serial.println("TRIG: GPIO 21");
+  Serial.println("ECHO: GPIO 22");
+
+  // Bluetooth Classic
+  SerialBT.begin(NOMBRE_BT);
 
   Serial.println("==============================");
-  Serial.println("CAMARA LISTA");
-  Serial.print("ABRIR: http://");
-  Serial.println(WiFi.localIP());
+  Serial.println(" ROBOT ESP32 - 4 RUEDAS");
+  Serial.println(" BLUETOOTH + HC-SR04");
+  Serial.print(" Bluetooth: ");
+  Serial.println(NOMBRE_BT);
   Serial.println("==============================");
 }
 
@@ -326,5 +560,37 @@ void setup() {
 // =====================================
 void loop() {
 
-  delay(1000);
+  while (SerialBT.available()) {
+
+    int b = SerialBT.read();
+
+    procesarByte(b);
+  }
+
+  if (Serial.available()) {
+
+    String comando = Serial.readStringUntil('\n');
+
+    procesarComando(comando);
+  }
+
+  actualizarTrigger();
+  actualizarDistancia();
+  enviarDistancia();
+
+  static bool eraConectado = false;
+
+  bool conectado = SerialBT.hasClient();
+
+  if (eraConectado && !conectado) {
+
+    detener();
+
+    Serial.println("BLUETOOTH DESCONECTADO: MOTORES DETENIDOS");
+  }
+
+  eraConectado = conectado;
+
+  actualizarRampa();
 }
+
