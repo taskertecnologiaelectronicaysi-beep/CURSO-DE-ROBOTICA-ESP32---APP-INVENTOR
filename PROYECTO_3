@@ -100,9 +100,19 @@ bool invM2B = false;
 // =====================================
 // CONFIGURACION PID
 // =====================================
-float Kp = 35.0;
-float Ki = 0.5;
-float Kd = 0.18;
+// Ganancias (el error va de -2 a 2, asi que Kp debe ser alto:
+// con Kp=75 y error=2 la correccion es 150 PWM)
+float Kp = 75.0;
+float Ki = 0.0;    // en seguidores de linea casi nunca hace falta
+float Kd = 1.0;
+
+// Filtro de la derivada (0 a 1): menor = mas suave, mas lento
+float filtroDerivada = 0.3;
+float derivadaFiltrada = 0;
+
+// Reduccion de velocidad en curvas (0 a 1): con error maximo (2)
+// la velocidad base baja este porcentaje. 0 = sin reduccion.
+float reduccionCurva = 0.30;
 
 float errorPID = 0;
 float errorAnterior = 0;
@@ -110,7 +120,7 @@ float integralPID = 0;
 float derivadaPID = 0;
 
 float limiteIntegral = 10.0;
-float limiteCorreccion = 120.0;
+float limiteCorreccion = 220.0;
 
 // Una rueda puede girar hacia atras hasta este PWM
 // cuando la correccion es muy fuerte (curvas cerradas)
@@ -124,32 +134,38 @@ unsigned long ultimaLecturaControl = 0;
 // CONFIGURACION DE ESQUINAS / CURVAS CERRADAS
 // =====================================
 
-// PWM usado al pivotar (giro sobre su eje).
-// Se toma de la velocidad base pero limitado a este rango,
-// porque un robot de 4 ruedas necesita mas fuerza para pivotar.
-#define PWM_GIRO_MIN 110
-#define PWM_GIRO_MAX 200
+// PWM del pivote (giro sobre su eje). Se calcula como el 70 % de la
+// velocidad base, limitado a este rango. Si el robot se pasa de la
+// curva, BAJA estos valores. Si no tiene fuerza para girar, sube MIN.
+#define PWM_GIRO_MIN 90
+#define PWM_GIRO_MAX 150
 
-// Cantidad minima de sensores activos para considerar
-// que hay una esquina (con un sensor extremo activo)
+// Sensores minimos activos (con los dos del borde del lado de la
+// curva encendidos) para considerar una esquina
 #define ESQUINA_MIN_SENSORES 3
 
-// Avance corto antes de pivotar, para que el eje de las
-// ruedas quede sobre la esquina (los sensores van adelante).
-// Ajusta segun la distancia sensor-eje: 0 a 80 ms.
-#define AVANCE_ESQUINA_MS 30
+// *** PARAMETRO MAS IMPORTANTE ***
+// Avance antes de pivotar. Debe ser el tiempo que tarda el robot en
+// recorrer la distancia entre la barra de sensores y el EJE de las
+// ruedas: asi el robot gira exactamente sobre la esquina.
+//   tiempo (ms) = distancia (cm) / velocidad (cm/s) * 1000
+// Si pivota y la linea queda "lejos", aumenta este valor.
+// Si se pasa de la esquina antes de girar, disminuyelo.
+#define AVANCE_ESQUINA_MS 60
 
-// Tiempo maximo de un giro de esquina
-#define GIRO_MAX_MS 1200
+// Giro minimo antes de aceptar que encontro la linea (evita falsos positivos)
+#define GIRO_MIN_MS 40
+
+// Tiempo maximo de un giro de esquina (antes eran 1200 ms = casi 180 grados)
+#define GIRO_MAX_MS 700
 
 // Tiempo maximo buscando la linea perdida antes de detenerse
-#define PERDIDA_MAX_MS 1500
+#define PERDIDA_MAX_MS 800
 
 enum EstadoSeguimiento {
   SEG_SEGUIR,
   SEG_ESQ_AVANZAR,
-  SEG_ESQ_SALIR,
-  SEG_ESQ_ENTRAR,
+  SEG_ESQ_GIRAR,
   SEG_BUSCAR
 };
 
@@ -183,6 +199,19 @@ int limitarPWM(int valor) {
 
   if (valor < 0 && valor > -PWM_MIN)
     return -PWM_MIN;
+
+  return valor;
+}
+
+// Zona muerta para el PID: un motor por debajo de PWM_MIN no gira,
+// asi que ese rango se trata como 0. Antes limitarPWM() lo forzaba a
+// +-60, y la rueda interna saltaba de +60 a -60 de golpe (movimiento
+// brusco y descoordinado).
+int zonaMuerta(int valor) {
+
+  valor = constrain(valor, -255, 255);
+
+  if (abs(valor) < PWM_MIN) return 0;
 
   return valor;
 }
@@ -346,6 +375,7 @@ void reiniciarControl() {
   errorAnterior = 0;
   integralPID = 0;
   derivadaPID = 0;
+  derivadaFiltrada = 0;
 
   estadoSeg = SEG_SEGUIR;
   ladoGiro = 0;
@@ -535,8 +565,7 @@ void cambiarEstadoSeg(EstadoSeguimiento nuevo) {
   switch (nuevo) {
     case SEG_SEGUIR:      Serial.println("SEG: SEGUIR LINEA"); break;
     case SEG_ESQ_AVANZAR: Serial.println("SEG: ESQUINA - AVANZAR"); break;
-    case SEG_ESQ_SALIR:   Serial.println("SEG: ESQUINA - GIRANDO"); break;
-    case SEG_ESQ_ENTRAR:  Serial.println("SEG: ESQUINA - BUSCANDO LINEA"); break;
+    case SEG_ESQ_GIRAR:   Serial.println("SEG: ESQUINA - GIRANDO"); break;
     case SEG_BUSCAR:      Serial.println("SEG: LINEA PERDIDA - BUSCANDO"); break;
   }
 }
@@ -545,6 +574,7 @@ void reanudarSeguimiento(float posicion) {
 
   integralPID = 0;
   derivadaPID = 0;
+  derivadaFiltrada = 0;
   errorAnterior = posicion;
 
   cambiarEstadoSeg(SEG_SEGUIR);
@@ -558,18 +588,25 @@ void reanudarSeguimiento(float posicion) {
 // busqueda). Devuelve false si se debe seguir
 // la linea normalmente (reglas o PID).
 //
-// Casos que resuelve:
-//  - Esquina de 90 grados: varios sensores activos
-//    incluyendo un extremo (S1 o S5) -> avanza un
-//    poco y pivota hasta encontrar la nueva linea.
-//  - Linea perdida: en lugar de detenerse, pivota
-//    hacia el ultimo lado donde vio la linea.
+// CAMBIOS RESPECTO A LA VERSION ANTERIOR:
+//  - Antes el giro tenia 2 fases: "esperar a que el sensor central
+//    SALGA de la linea" y luego "esperar a que ENTRE". Eso solo
+//    funciona si el robot gira exactamente sobre la esquina; si no,
+//    el sensor central nunca encuentra la linea y el robot giraba
+//    hasta el tiempo maximo (casi 180 grados).
+//  - Ahora hay una sola fase: pivotar hasta que la linea quede
+//    CENTRADA (sensor central activo y sensores de los bordes
+//    apagados). Esto termina al alinearse con la nueva linea, sea
+//    de 30, 60 o 90 grados.
+//  - La esquina solo se detecta con 2 sensores contiguos del borde
+//    (S1+S2 o S5+S4), para que las curvas suaves las resuelva el PID.
+//  - Velocidad de pivote y tiempos maximos reducidos.
 // =====================================
 bool gestionarGiros(const bool s[5], int n, float pos, int base) {
 
   unsigned long ahora = millis();
 
-  int velGiro = constrain(base, PWM_GIRO_MIN, PWM_GIRO_MAX);
+  int velGiro = constrain(base * 70 / 100, PWM_GIRO_MIN, PWM_GIRO_MAX);
 
   // Recordar de que lado estaba la linea
   if (n > 0) {
@@ -583,7 +620,7 @@ bool gestionarGiros(const bool s[5], int n, float pos, int base) {
   switch (estadoSeg) {
 
     // ---------------------------------
-    case SEG_SEGUIR:
+    case SEG_SEGUIR: {
 
       // Linea perdida: buscar hacia el ultimo lado
       if (n == 0) {
@@ -597,20 +634,12 @@ bool gestionarGiros(const bool s[5], int n, float pos, int base) {
         return true;
       }
 
-      // Esquina a la izquierda
-      if (n >= ESQUINA_MIN_SENSORES && s[0] && !s[4]) {
+      bool esquinaIzq = (n >= ESQUINA_MIN_SENSORES) && s[0] && s[1] && !s[4];
+      bool esquinaDer = (n >= ESQUINA_MIN_SENSORES) && s[4] && s[3] && !s[0];
 
-        ladoGiro = -1;
-        cambiarEstadoSeg(SEG_ESQ_AVANZAR);
-        establecerObjetivos(base, base);
+      if (esquinaIzq || esquinaDer) {
 
-        return true;
-      }
-
-      // Esquina a la derecha
-      if (n >= ESQUINA_MIN_SENSORES && s[4] && !s[0]) {
-
-        ladoGiro = 1;
+        ladoGiro = esquinaIzq ? -1 : 1;
         cambiarEstadoSeg(SEG_ESQ_AVANZAR);
         establecerObjetivos(base, base);
 
@@ -618,43 +647,29 @@ bool gestionarGiros(const bool s[5], int n, float pos, int base) {
       }
 
       return false;
+    }
 
     // ---------------------------------
+    // Avanzar hasta que el eje de las ruedas quede sobre la esquina
     case SEG_ESQ_AVANZAR:
 
       establecerObjetivos(base, base);
 
       if (ahora - inicioEstado >= AVANCE_ESQUINA_MS) {
-        cambiarEstadoSeg(SEG_ESQ_SALIR);
+        cambiarEstadoSeg(SEG_ESQ_GIRAR);
       }
 
       return true;
 
     // ---------------------------------
-    // Pivotar hasta que el sensor central
-    // abandone la linea vieja
-    case SEG_ESQ_SALIR:
+    // Pivotar hasta que la linea quede centrada
+    case SEG_ESQ_GIRAR: {
 
       pivotar(ladoGiro, velGiro);
 
-      if (!s[2]) {
-        cambiarEstadoSeg(SEG_ESQ_ENTRAR);
-      }
-      else if (ahora - inicioEstado >= GIRO_MAX_MS) {
-        perdidaDesde = ahora;
-        cambiarEstadoSeg(SEG_BUSCAR);
-      }
+      bool centrada = s[2] && !s[0] && !s[4];
 
-      return true;
-
-    // ---------------------------------
-    // Seguir pivotando hasta que el sensor
-    // central encuentre la linea nueva
-    case SEG_ESQ_ENTRAR:
-
-      pivotar(ladoGiro, velGiro);
-
-      if (s[2]) {
+      if (centrada && (ahora - inicioEstado >= GIRO_MIN_MS)) {
         reanudarSeguimiento(pos);
         return false;
       }
@@ -665,6 +680,7 @@ bool gestionarGiros(const bool s[5], int n, float pos, int base) {
       }
 
       return true;
+    }
 
     // ---------------------------------
     case SEG_BUSCAR:
@@ -788,9 +804,12 @@ void ejecutarPID() {
     limiteIntegral
   );
 
-  // Derivada
-  derivadaPID =
-    (errorPID - errorAnterior) / dt;
+  // Derivada filtrada (los sensores digitales dan saltos bruscos)
+  float derivadaCruda = (errorPID - errorAnterior) / dt;
+
+  derivadaFiltrada += filtroDerivada * (derivadaCruda - derivadaFiltrada);
+
+  derivadaPID = derivadaFiltrada;
 
   // Salida PID
   float correccion =
@@ -806,16 +825,26 @@ void ejecutarPID() {
 
   errorAnterior = errorPID;
 
+  // Reducir la velocidad base segun lo desviado que este el robot
+  int baseCurva = base - (int)(base * reduccionCurva * fabsf(errorPID) / 2.0);
+
+  baseCurva = max(baseCurva, (int)PWM_MIN);
+
   // Correccion diferencial
-  int izquierda = base + (int)correccion;
-  int derecha = base - (int)correccion;
+  int izquierda = baseCurva + (int)correccion;
+  int derecha = baseCurva - (int)correccion;
 
   // Permite que la rueda interna retroceda un poco
   // en curvas muy cerradas
   izquierda = constrain(izquierda, -PWM_REVERSA_MAX, 255);
   derecha = constrain(derecha, -PWM_REVERSA_MAX, 255);
 
-  establecerObjetivos(izquierda, derecha);
+  // Zona muerta (en vez de forzar +-PWM_MIN)
+  izquierda = zonaMuerta(izquierda);
+  derecha = zonaMuerta(derecha);
+
+  objIzq = izquierda;
+  objDer = derecha;
 
   // Informacion de prueba cada 200 ms
   static unsigned long ultimaImpresionPID = 0;
